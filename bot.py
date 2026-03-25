@@ -8,21 +8,21 @@ from zoneinfo import ZoneInfo
 TOKEN = os.environ["TOKEN"]
 CHAT_ID = os.environ["CHAT_ID"]
 
-SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "DOGEUSDT"]
 LOW_TF = "15m"
 MID_TF = "1h"
 HIGH_TF = "4h"
 CHECK_EVERY_SECONDS = 60
-MAX_SIGNALS_PER_DAY = 3
+MAX_SIGNALS_PER_DAY = 4
 
 ATR_SL_MULTIPLIER = 1.3
 ATR_TP_MULTIPLIER = 2.6
-MIN_ADX = 18
+MIN_ADX = 14
 
 TRADES_FILE = "trades.csv"
 
 LOCAL_TZ = ZoneInfo("America/Toronto")
-SCHEDULED_TIMES = [(10, 30), (15, 30), (21, 0)]  # 10:30 AM, 3:30 PM, 9:00 PM
+SCHEDULED_TIMES = [(10, 30), (15, 30), (21, 0)]
 
 last_signal_by_symbol = {}
 signals_today = 0
@@ -253,10 +253,10 @@ def build_signal(symbol):
     high_bear = high["close"] < high["ema50"] < high["ema200"]
 
     strong_trend = row["adx14"] >= MIN_ADX
-    not_overextended_long = 50 <= row["rsi14"] <= 72
-    not_overextended_short = 28 <= row["rsi14"] <= 50
+    not_overextended_long = 45 <= row["rsi14"] <= 75
+    not_overextended_short = 25 <= row["rsi14"] <= 55
 
-    volatility_ok = (atr_val / price) >= 0.002
+    volatility_ok = (atr_val / price) >= 0.0012
 
     long_cond = (
         bullish_cross and mid_bull and high_bull and strong_trend and
