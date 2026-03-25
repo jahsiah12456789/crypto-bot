@@ -297,7 +297,7 @@ def handle_commands():
             send(open_trades_text())
 
 def main():
-    global signals_today, last_summary_hour
+    global signals_today, last_summary_hour, last_no_signal_day
     ensure_trades_file()
     send("✅ Upgraded sniper bot started")
     while True:
@@ -305,6 +305,7 @@ def main():
             reset_daily_counter()
             handle_commands()
             update_open_trades()
+
             if signals_today < MAX_SIGNALS_PER_DAY:
                 for symbol in SYMBOLS:
                     if signals_today >= MAX_SIGNALS_PER_DAY:
@@ -333,22 +334,24 @@ def main():
                             print(symbol, "- duplicate skipped")
                     except Exception as symbol_error:
                         print(symbol, "error:", symbol_error)
+
             now = datetime.now(timezone.utc)
-hour_key = now.strftime("%Y-%m-%d-%H")
+            hour_key = now.strftime("%Y-%m-%d-%H")
 
-if now.minute == 0 and last_summary_hour != hour_key:
-    send(summarize_performance())
-    last_summary_hour = hour_key
+            if now.minute == 0 and last_summary_hour != hour_key:
+                send(summarize_performance())
+                last_summary_hour = hour_key
 
-today = now.date()
+            today = now.date()
 
-if now.hour == 23 and now.minute >= 55:
-    if signals_today == 0 and last_no_signal_day != today:
-        send("📭 No signals today — market not clean")
-        last_no_signal_day = today
-                
+            if now.hour == 23 and now.minute >= 55:
+                if signals_today == 0 and last_no_signal_day != today:
+                    send("📭 No signals today — market not clean")
+                    last_no_signal_day = today
+
         except Exception as e:
             print("Main loop error:", e)
+
         time.sleep(CHECK_EVERY_SECONDS)
 
 if __name__ == "__main__":
