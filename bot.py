@@ -17,7 +17,7 @@ MAX_SIGNALS_PER_DAY = 3
 
 ATR_SL_MULTIPLIER = 1.3
 ATR_TP_MULTIPLIER = 2.6
-MIN_ADX = 22
+MIN_ADX = 18
 
 TRADES_FILE = "trades.csv"
 
@@ -253,21 +253,20 @@ def build_signal(symbol):
     high_bear = high["close"] < high["ema50"] < high["ema200"]
 
     strong_trend = row["adx14"] >= MIN_ADX
-    not_overextended_long = 53 <= row["rsi14"] <= 68
-    not_overextended_short = 32 <= row["rsi14"] <= 47
+    not_overextended_long = 50 <= row["rsi14"] <= 72
+    not_overextended_short = 28 <= row["rsi14"] <= 50
 
     volatility_ok = (atr_val / price) >= 0.002
-    huge_candle = abs(row["close"] - row["open"]) > atr_val * 1.8
 
     long_cond = (
         bullish_cross and mid_bull and high_bull and strong_trend and
         not_overextended_long and row["close"] > row["ema21"] and
-        volatility_ok and not huge_candle
+        volatility_ok
     )
     short_cond = (
         bearish_cross and mid_bear and high_bear and strong_trend and
         not_overextended_short and row["close"] < row["ema21"] and
-        volatility_ok and not huge_candle
+        volatility_ok
     )
 
     if long_cond:
