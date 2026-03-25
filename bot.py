@@ -3,6 +3,7 @@ import time
 import requests
 import pandas as pd
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 TOKEN = os.environ["TOKEN"]
 CHAT_ID = os.environ["CHAT_ID"]
@@ -20,13 +21,18 @@ MIN_ADX = 22
 
 TRADES_FILE = "trades.csv"
 
+LOCAL_TZ = ZoneInfo("America/Toronto")
+SCHEDULED_TIMES = [(10, 30), (15, 30), (21, 0)]  # 10:30 AM, 3:30 PM, 9:00 PM
+
 last_signal_by_symbol = {}
 signals_today = 0
 last_reset_day = None
 open_trades = {}
-last_summary_hour = None
 last_update_id = 0
 last_no_signal_day = None
+last_scheduled_key = None
+last_5h_update = None
+
 
 def send(msg):
     requests.post(
@@ -34,6 +40,7 @@ def send(msg):
         json={"chat_id": CHAT_ID, "text": msg},
         timeout=20,
     )
+
 
 def get_updates():
     global last_update_id
@@ -44,6 +51,7 @@ def get_updates():
     if data:
         last_update_id = data[-1]["update_id"]
     return data
+
 
 def get_data(symbol, interval, limit=300):
     r = requests.get(
@@ -61,8 +69,10 @@ def get_data(symbol, interval, limit=300):
     df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
     return df
 
+
 def ema(series, n):
     return series.ewm(span=n, adjust=False).mean()
+
 
 def rsi(series, n=14):
     delta = series.diff()
@@ -73,6 +83,7 @@ def rsi(series, n=14):
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
+
 def atr(df, n=14):
     hl = df["high"] - df["low"]
     hc = (df["high"] - df["close"].shift()).abs()
@@ -80,20 +91,26 @@ def atr(df, n=14):
     tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
     return tr.ewm(alpha=1 / n, adjust=False).mean()
 
+
 def adx(df, n=14):
     up_move = df["high"].diff()
     down_move = -df["low"].diff()
+
     plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
     minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
+
     tr1 = df["high"] - df["low"]
     tr2 = (df["high"] - df["close"].shift()).abs()
     tr3 = (df["low"] - df["close"].shift()).abs()
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
     atr_smoothed = tr.ewm(alpha=1 / n, adjust=False).mean()
     plus_di = 100 * (plus_dm.ewm(alpha=1 / n, adjust=False).mean() / atr_smoothed)
     minus_di = 100 * (minus_dm.ewm(alpha=1 / n, adjust=False).mean() / atr_smoothed)
+
     dx = ((plus_di - minus_di).abs() / (plus_di + minus_di).abs()) * 100
     return dx.ewm(alpha=1 / n, adjust=False).mean()
+
 
 def add_indicators(df):
     df = df.copy()
@@ -106,12 +123,14 @@ def add_indicators(df):
     df["adx14"] = adx(df, 14)
     return df
 
+
 def ensure_trades_file():
     if not os.path.exists(TRADES_FILE):
         pd.DataFrame(columns=[
             "symbol", "side", "entry_time", "entry_price", "sl", "tp",
             "exit_time", "exit_price", "status", "pnl_pct", "r_multiple"
         ]).to_csv(TRADES_FILE, index=False)
+
 
 def log_new_trade(symbol, side, entry_time, entry_price, sl, tp):
     df = pd.read_csv(TRADES_FILE)
@@ -120,21 +139,25 @@ def log_new_trade(symbol, side, entry_time, entry_price, sl, tp):
     ]
     df.to_csv(TRADES_FILE, index=False)
 
+
 def close_trade(symbol, exit_time, exit_price, status):
     df = pd.read_csv(TRADES_FILE)
     open_rows = df[(df["symbol"] == symbol) & (df["status"] == "OPEN")]
     if open_rows.empty:
         return
+
     idx = open_rows.index[-1]
     side = df.loc[idx, "side"]
     entry = float(df.loc[idx, "entry_price"])
     sl = float(df.loc[idx, "sl"])
+
     if side == "LONG":
         pnl_pct = ((exit_price - entry) / entry) * 100
         r_multiple = (exit_price - entry) / (entry - sl) if entry != sl else 0
     else:
         pnl_pct = ((entry - exit_price) / entry) * 100
         r_multiple = (entry - exit_price) / (sl - entry) if entry != sl else 0
+
     df.loc[idx, "exit_time"] = exit_time
     df.loc[idx, "exit_price"] = round(exit_price, 6)
     df.loc[idx, "status"] = status
@@ -142,27 +165,33 @@ def close_trade(symbol, exit_time, exit_price, status):
     df.loc[idx, "r_multiple"] = round(r_multiple, 3)
     df.to_csv(TRADES_FILE, index=False)
 
+
 def summarize_performance():
     df = pd.read_csv(TRADES_FILE)
     closed = df[df["status"].isin(["TP", "SL"])]
     open_count = len(df[df["status"] == "OPEN"])
+
     if closed.empty:
         return (
-            f"📊 Stats\n"
+            f"📊 VIP STATS\n"
+            f"━━━━━━━━━━━━━━\n"
             f"Closed Trades: 0\n"
             f"Open Trades: {open_count}\n"
             f"Win Rate: 0%\n"
             f"Total PnL %: 0%\n"
             f"Total R: 0"
         )
+
     wins = (closed["status"] == "TP").sum()
     losses = (closed["status"] == "SL").sum()
     total = len(closed)
     win_rate = round((wins / total) * 100, 2) if total else 0
     total_r = round(pd.to_numeric(closed["r_multiple"], errors="coerce").fillna(0).sum(), 2)
     total_pnl = round(pd.to_numeric(closed["pnl_pct"], errors="coerce").fillna(0).sum(), 2)
+
     return (
-        f"📊 Stats\n"
+        f"📊 VIP STATS\n"
+        f"━━━━━━━━━━━━━━\n"
         f"Closed Trades: {total}\n"
         f"Open Trades: {open_count}\n"
         f"Wins: {wins}\n"
@@ -172,16 +201,25 @@ def summarize_performance():
         f"Total R: {total_r}"
     )
 
+
 def open_trades_text():
     if not open_trades:
         return "No open trades."
-    lines = ["📂 Open Trades"]
+
+    lines = ["📂 OPEN TRADES"]
     for symbol, t in open_trades.items():
         lines.append(
             f"{symbol} {t['side']} | Entry: {round(t['entry'], 4)} | "
             f"SL: {round(t['sl'], 4)} | TP: {round(t['tp'], 4)}"
         )
     return "\n".join(lines)
+
+
+def scheduled_update_text():
+    stats = summarize_performance()
+    opens = open_trades_text()
+    return f"📡 VIP MARKET UPDATE\n\n{stats}\n\n{opens}"
+
 
 def reset_daily_counter():
     global signals_today, last_reset_day
@@ -190,28 +228,37 @@ def reset_daily_counter():
         signals_today = 0
         last_reset_day = today
 
+
 def build_signal(symbol):
     low_df = add_indicators(get_data(symbol, LOW_TF))
     mid_df = add_indicators(get_data(symbol, MID_TF))
     high_df = add_indicators(get_data(symbol, HIGH_TF))
+
     row = low_df.iloc[-2]
     prev = low_df.iloc[-3]
     mid = mid_df.iloc[-2]
     high = high_df.iloc[-2]
+
     price = float(row["close"])
     candle_time = str(row["close_time"])
     atr_val = float(row["atr14"])
+
     bullish_cross = prev["ema9"] <= prev["ema21"] and row["ema9"] > row["ema21"]
     bearish_cross = prev["ema9"] >= prev["ema21"] and row["ema9"] < row["ema21"]
+
     mid_bull = mid["close"] > mid["ema50"] > mid["ema200"]
     mid_bear = mid["close"] < mid["ema50"] < mid["ema200"]
+
     high_bull = high["close"] > high["ema50"] > high["ema200"]
     high_bear = high["close"] < high["ema50"] < high["ema200"]
+
     strong_trend = row["adx14"] >= MIN_ADX
     not_overextended_long = 53 <= row["rsi14"] <= 68
     not_overextended_short = 32 <= row["rsi14"] <= 47
+
     volatility_ok = (atr_val / price) >= 0.002
     huge_candle = abs(row["close"] - row["open"]) > atr_val * 1.8
+
     long_cond = (
         bullish_cross and mid_bull and high_bull and strong_trend and
         not_overextended_long and row["close"] > row["ema21"] and
@@ -222,6 +269,7 @@ def build_signal(symbol):
         not_overextended_short and row["close"] < row["ema21"] and
         volatility_ok and not huge_candle
     )
+
     if long_cond:
         side = "LONG"
         sl = price - atr_val * ATR_SL_MULTIPLIER
@@ -232,20 +280,30 @@ def build_signal(symbol):
         tp = price - atr_val * ATR_TP_MULTIPLIER
     else:
         return None
+
     rr = round(abs(tp - price) / abs(price - sl), 2) if price != sl else 0
     signal_key = f"{side}-{candle_time}"
+
+    emoji = "🟢" if side == "LONG" else "🔴"
+    action = "BUY" if side == "LONG" else "SELL"
+
     msg = (
-        f"🎯 {symbol} {side}\n"
-        f"Time: {candle_time}\n"
-        f"Entry: {round(price, 4)}\n"
-        f"SL: {round(sl, 4)}\n"
-        f"TP: {round(tp, 4)}\n"
-        f"RR: {rr}\n"
-        f"RSI: {round(float(row['rsi14']), 2)}\n"
-        f"ADX: {round(float(row['adx14']), 2)}\n"
-        f"Signals Today: {signals_today + 1}/{MAX_SIGNALS_PER_DAY}"
+        f"🚨 VIP SIGNAL ALERT 🚨\n\n"
+        f"{emoji} {symbol} — {action} {side}\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"📍 Entry: {round(price, 4)}\n"
+        f"🛑 Stop Loss: {round(sl, 4)}\n"
+        f"🎯 Take Profit: {round(tp, 4)}\n"
+        f"📊 Risk/Reward: {rr}\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"📈 RSI: {round(float(row['rsi14']), 2)}\n"
+        f"🔥 ADX: {round(float(row['adx14']), 2)}\n"
+        f"🕒 Time: {candle_time}\n"
+        f"📦 Daily Signals: {signals_today + 1}/{MAX_SIGNALS_PER_DAY}\n\n"
+        f"⚠️ Manage risk properly."
     )
     return signal_key, msg, side, candle_time, price, sl, tp
+
 
 def update_open_trades():
     to_remove = []
@@ -256,28 +314,47 @@ def update_open_trades():
             high = float(row["high"])
             low = float(row["low"])
             close_time = str(row["close_time"])
+
             if trade["side"] == "LONG":
                 if low <= trade["sl"]:
                     close_trade(symbol, close_time, trade["sl"], "SL")
-                    send(f"🛑 {symbol} LONG stopped out\nExit: {round(trade['sl'], 4)}")
+                    send(
+                        f"❌ VIP TRADE CLOSED\n\n"
+                        f"🔴 {symbol} LONG stopped out\n"
+                        f"🛑 Exit: {round(trade['sl'], 4)}"
+                    )
                     to_remove.append(symbol)
                 elif high >= trade["tp"]:
                     close_trade(symbol, close_time, trade["tp"], "TP")
-                    send(f"💰 {symbol} LONG take profit hit\nExit: {round(trade['tp'], 4)}")
+                    send(
+                        f"✅ VIP TRADE CLOSED\n\n"
+                        f"🟢 {symbol} LONG take profit hit\n"
+                        f"🎯 Exit: {round(trade['tp'], 4)}"
+                    )
                     to_remove.append(symbol)
             else:
                 if high >= trade["sl"]:
                     close_trade(symbol, close_time, trade["sl"], "SL")
-                    send(f"🛑 {symbol} SHORT stopped out\nExit: {round(trade['sl'], 4)}")
+                    send(
+                        f"❌ VIP TRADE CLOSED\n\n"
+                        f"🔴 {symbol} SHORT stopped out\n"
+                        f"🛑 Exit: {round(trade['sl'], 4)}"
+                    )
                     to_remove.append(symbol)
                 elif low <= trade["tp"]:
                     close_trade(symbol, close_time, trade["tp"], "TP")
-                    send(f"💰 {symbol} SHORT take profit hit\nExit: {round(trade['tp'], 4)}")
+                    send(
+                        f"✅ VIP TRADE CLOSED\n\n"
+                        f"🟢 {symbol} SHORT take profit hit\n"
+                        f"🎯 Exit: {round(trade['tp'], 4)}"
+                    )
                     to_remove.append(symbol)
         except Exception as e:
             print("Trade update error:", symbol, e)
+
     for symbol in to_remove:
         open_trades.pop(symbol, None)
+
 
 def handle_commands():
     updates = get_updates()
@@ -285,10 +362,12 @@ def handle_commands():
         message = update.get("message", {})
         text = message.get("text", "").strip().lower()
         chat_id = str(message.get("chat", {}).get("id", ""))
+
         if chat_id != str(CHAT_ID):
             continue
+
         if text == "/start":
-            send("✅ Bot is running.\nCommands:\n/stats\n/opentrades\n/help")
+            send("🚀 VIP signal bot is now live.\nCommands:\n/stats\n/opentrades\n/help")
         elif text == "/help":
             send("Commands:\n/stats - performance summary\n/opentrades - show open trades")
         elif text == "/stats":
@@ -296,10 +375,13 @@ def handle_commands():
         elif text == "/opentrades":
             send(open_trades_text())
 
+
 def main():
-    global signals_today, last_summary_hour, last_no_signal_day
+    global signals_today, last_no_signal_day, last_scheduled_key, last_5h_update
+
     ensure_trades_file()
-    send("✅ Upgraded sniper bot started")
+    send("🚀 VIP signal bot is now live.")
+
     while True:
         try:
             reset_daily_counter()
@@ -310,14 +392,18 @@ def main():
                 for symbol in SYMBOLS:
                     if signals_today >= MAX_SIGNALS_PER_DAY:
                         break
+
                     if symbol in open_trades:
                         continue
+
                     try:
                         result = build_signal(symbol)
                         if not result:
                             print(symbol, "- no strong signal")
                             continue
+
                         signal_key, msg, side, candle_time, price, sl, tp = result
+
                         if last_signal_by_symbol.get(symbol) != signal_key:
                             send(msg)
                             last_signal_by_symbol[symbol] = signal_key
@@ -332,18 +418,25 @@ def main():
                             signals_today += 1
                         else:
                             print(symbol, "- duplicate skipped")
+
                     except Exception as symbol_error:
                         print(symbol, "error:", symbol_error)
 
             now = datetime.now(timezone.utc)
-            hour_key = now.strftime("%Y-%m-%d-%H")
 
-            if now.minute == 0 and last_summary_hour != hour_key:
+            local_now = now.astimezone(LOCAL_TZ)
+            scheduled_key = local_now.strftime("%Y-%m-%d-%H-%M")
+            if (local_now.hour, local_now.minute) in SCHEDULED_TIMES:
+                if last_scheduled_key != scheduled_key:
+                    send(scheduled_update_text())
+                    last_scheduled_key = scheduled_key
+
+            five_hour_bucket = now.strftime("%Y-%m-%d-") + str(now.hour // 5)
+            if now.minute == 0 and last_5h_update != five_hour_bucket:
                 send(summarize_performance())
-                last_summary_hour = hour_key
+                last_5h_update = five_hour_bucket
 
             today = now.date()
-
             if now.hour == 23 and now.minute >= 55:
                 if signals_today == 0 and last_no_signal_day != today:
                     send("📭 No signals today — market not clean")
@@ -353,6 +446,7 @@ def main():
             print("Main loop error:", e)
 
         time.sleep(CHECK_EVERY_SECONDS)
+
 
 if __name__ == "__main__":
     main()
