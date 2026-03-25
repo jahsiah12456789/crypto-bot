@@ -26,6 +26,7 @@ last_reset_day = None
 open_trades = {}
 last_summary_hour = None
 last_update_id = 0
+last_no_signal_day = None
 
 def send(msg):
     requests.post(
@@ -333,10 +334,19 @@ def main():
                     except Exception as symbol_error:
                         print(symbol, "error:", symbol_error)
             now = datetime.now(timezone.utc)
-            hour_key = now.strftime("%Y-%m-%d-%H")
-            if now.minute == 0 and last_summary_hour != hour_key:
-                send(summarize_performance())
-                last_summary_hour = hour_key
+hour_key = now.strftime("%Y-%m-%d-%H")
+
+if now.minute == 0 and last_summary_hour != hour_key:
+    send(summarize_performance())
+    last_summary_hour = hour_key
+
+today = now.date()
+
+if now.hour == 23 and now.minute >= 55:
+    if signals_today == 0 and last_no_signal_day != today:
+        send("📭 No signals today — market not clean")
+        last_no_signal_day = today
+                
         except Exception as e:
             print("Main loop error:", e)
         time.sleep(CHECK_EVERY_SECONDS)
