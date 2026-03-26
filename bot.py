@@ -8,21 +8,26 @@ from zoneinfo import ZoneInfo
 TOKEN = os.environ["TOKEN"]
 CHAT_ID = os.environ["CHAT_ID"]
 
-SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "DOGEUSDT"]
+# Smart aggressive mode coin list
+SYMBOLS = [
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT",
+    "XRPUSDT", "DOGEUSDT", "AVAXUSDT", "LINKUSDT"
+]
+
 LOW_TF = "15m"
 MID_TF = "1h"
 HIGH_TF = "4h"
 CHECK_EVERY_SECONDS = 60
-MAX_SIGNALS_PER_DAY = 4
+MAX_SIGNALS_PER_DAY = 5
 
 ATR_SL_MULTIPLIER = 1.3
 ATR_TP_MULTIPLIER = 2.6
-MIN_ADX = 14
+MIN_ADX = 10
 
 TRADES_FILE = "trades.csv"
 
 LOCAL_TZ = ZoneInfo("America/Toronto")
-SCHEDULED_TIMES = [(10, 30), (15, 30), (21, 0)]
+SCHEDULED_TIMES = [(10, 30), (15, 30), (21, 0)]  # 10:30 AM, 3:30 PM, 9:00 PM
 
 last_signal_by_symbol = {}
 signals_today = 0
@@ -45,7 +50,11 @@ def send(msg):
 def get_updates():
     global last_update_id
     url = f"https://api.telegram.org/bot{TOKEN}/getUpdates"
-    r = requests.get(url, params={"offset": last_update_id + 1, "timeout": 10}, timeout=20)
+    r = requests.get(
+        url,
+        params={"offset": last_update_id + 1, "timeout": 10},
+        timeout=20,
+    )
     r.raise_for_status()
     data = r.json().get("result", [])
     if data:
@@ -60,10 +69,13 @@ def get_data(symbol, interval, limit=300):
         timeout=20,
     )
     r.raise_for_status()
-    df = pd.DataFrame(r.json(), columns=[
-        "open_time", "open", "high", "low", "close", "volume",
-        "close_time", "qav", "trades", "tbav", "tqav", "ignore"
-    ])
+    df = pd.DataFrame(
+        r.json(),
+        columns=[
+            "open_time", "open", "high", "low", "close", "volume",
+            "close_time", "qav", "trades", "tbav", "tqav", "ignore"
+        ],
+    )
     for col in ["open", "high", "low", "close", "volume"]:
         df[col] = pd.to_numeric(df[col])
     df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
@@ -126,10 +138,12 @@ def add_indicators(df):
 
 def ensure_trades_file():
     if not os.path.exists(TRADES_FILE):
-        pd.DataFrame(columns=[
-            "symbol", "side", "entry_time", "entry_price", "sl", "tp",
-            "exit_time", "exit_price", "status", "pnl_pct", "r_multiple"
-        ]).to_csv(TRADES_FILE, index=False)
+        pd.DataFrame(
+            columns=[
+                "symbol", "side", "entry_time", "entry_price", "sl", "tp",
+                "exit_time", "exit_price", "status", "pnl_pct", "r_multiple",
+            ]
+        ).to_csv(TRADES_FILE, index=False)
 
 
 def log_new_trade(symbol, side, entry_time, entry_price, sl, tp):
@@ -235,7 +249,6 @@ def build_signal(symbol):
     high_df = add_indicators(get_data(symbol, HIGH_TF))
 
     row = low_df.iloc[-2]
-    prev = low_df.iloc[-3]
     mid = mid_df.iloc[-2]
     high = high_df.iloc[-2]
 
@@ -243,30 +256,38 @@ def build_signal(symbol):
     candle_time = str(row["close_time"])
     atr_val = float(row["atr14"])
 
-    bullish_cross = prev["ema9"] <= prev["ema21"] and row["ema9"] > row["ema21"]
-    bearish_cross = prev["ema9"] >= prev["ema21"] and row["ema9"] < row["ema21"]
+    bullish_cross = row["ema9"] > row["ema21"]
+    bearish_cross = row["ema9"] < row["ema21"]
 
-    mid_bull = mid["close"] > mid["ema50"] > mid["ema200"]
-    mid_bear = mid["close"] < mid["ema50"] < mid["ema200"]
+    mid_bull = mid["close"] > mid["ema50"]
+    mid_bear = mid["close"] < mid["ema50"]
 
-    high_bull = high["close"] > high["ema50"] > high["ema200"]
-    high_bear = high["close"] < high["ema50"] < high["ema200"]
+    high_bull = high["close"] > high["ema50"]
+    high_bear = high["close"] < high["ema50"]
 
     strong_trend = row["adx14"] >= MIN_ADX
-    not_overextended_long = 45 <= row["rsi14"] <= 75
-    not_overextended_short = 25 <= row["rsi14"] <= 55
+    not_overextended_long = 40 <= row["rsi14"] <= 80
+    not_overextended_short = 20 <= row["rsi14"] <= 60
 
-    volatility_ok = (atr_val / price) >= 0.0012
+    volatility_ok = (atr_val / price) >= 0.0007
 
     long_cond = (
-        bullish_cross and mid_bull and high_bull and strong_trend and
-        not_overextended_long and row["close"] > row["ema21"] and
-        volatility_ok
+        bullish_cross
+        and mid_bull
+        and high_bull
+        and strong_trend
+        and not_overextended_long
+        and row["close"] > row["ema21"]
+        and volatility_ok
     )
     short_cond = (
-        bearish_cross and mid_bear and high_bear and strong_trend and
-        not_overextended_short and row["close"] < row["ema21"] and
-        volatility_ok
+        bearish_cross
+        and mid_bear
+        and high_bear
+        and strong_trend
+        and not_overextended_short
+        and row["close"] < row["ema21"]
+        and volatility_ok
     )
 
     if long_cond:
@@ -411,7 +432,7 @@ def main():
                                 "entry": price,
                                 "sl": sl,
                                 "tp": tp,
-                                "entry_time": candle_time
+                                "entry_time": candle_time,
                             }
                             log_new_trade(symbol, side, candle_time, price, sl, tp)
                             signals_today += 1
