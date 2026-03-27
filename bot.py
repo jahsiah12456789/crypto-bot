@@ -13,7 +13,9 @@ SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "DOGEUSDT", "AVAXUSDT"]
 LOW_TF = "15m"
 MID_TF = "30m"
 HIGH_TF = "1h"
-CHECK_EVERY_SECONDS = 30
+
+CHECK_EVERY_SECONDS = 10
+SCHEDULE_WINDOW_MINUTES = 2
 
 MAX_SIGNALS_PER_DAY = 6
 MAX_BONUS_SIGNALS_PER_DAY = 3
@@ -26,12 +28,11 @@ BONUS_MIN_ADX = 4
 TRADES_FILE = "trades.csv"
 
 LOCAL_TZ = ZoneInfo("America/Toronto")
-SCHEDULED_TIMES = [(10, 30), (15, 30), (21, 0)]  # 10:30 AM, 3:30 PM, 9:00 PM Toronto
+SCHEDULED_TIMES = [(10, 30), (15, 30), (21, 0)]
 FORCED_SIGNAL_SYMBOL = "BTCUSDT"
 
 START_HOUR = 9
-END_HOUR = 22  # 10 PM
-
+END_HOUR = 22
 
 last_signal_by_symbol = {}
 signals_today = 0
@@ -40,16 +41,18 @@ last_reset_day = None
 open_trades = {}
 last_update_id = 0
 last_no_signal_day = None
-last_scheduled_key = None
 last_5h_update = None
+
+sent_scheduled_slots = set()
 
 
 def send(msg):
-    requests.post(
+    r = requests.post(
         f"https://api.telegram.org/bot{TOKEN}/sendMessage",
         json={"chat_id": CHAT_ID, "text": msg},
         timeout=20,
     )
+    r.raise_for_status()
 
 
 def get_updates():
@@ -57,8 +60,8 @@ def get_updates():
     url = f"https://api.telegram.org/bot{TOKEN}/getUpdates"
     r = requests.get(
         url,
-        params={"offset": last_update_id + 1, "timeout": 10},
-        timeout=20,
+        params={"offset": last_update_id + 1, "timeout": 1},
+        timeout=5,
     )
     r.raise_for_status()
     data = r.json().get("result", [])
@@ -74,6 +77,7 @@ def get_data(symbol, interval, limit=300):
         timeout=20,
     )
     r.raise_for_status()
+
     df = pd.DataFrame(
         r.json(),
         columns=[
@@ -81,8 +85,10 @@ def get_data(symbol, interval, limit=300):
             "close_time", "qav", "trades", "tbav", "tqav", "ignore"
         ],
     )
+
     for col in ["open", "high", "low", "close", "volume"]:
-        df[col] = pd.to_numeric(df[col])
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
     df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
     return df
 
@@ -238,18 +244,17 @@ def open_trades_text():
 
 
 def scheduled_update_text():
-    stats = summarize_performance()
-    opens = open_trades_text()
-    return f"📡 VIP MARKET UPDATE\n\n{stats}\n\n{opens}"
+    return f"📡 VIP MARKET UPDATE\n\n{summarize_performance()}\n\n{open_trades_text()}"
 
 
-def reset_daily_counter():
-    global signals_today, bonus_signals_today, last_reset_day
-    today = datetime.now(timezone.utc).date()
+def reset_daily_counter(local_now):
+    global signals_today, bonus_signals_today, last_reset_day, sent_scheduled_slots
+    today = local_now.date()
     if last_reset_day != today:
         signals_today = 0
         bonus_signals_today = 0
         last_reset_day = today
+        sent_scheduled_slots = set()
 
 
 def format_signal_message(symbol, side, price, sl, tp, rr, rsi_value, adx_value, candle_time, signal_type):
@@ -278,7 +283,6 @@ def format_signal_message(symbol, side, price, sl, tp, rr, rsi_value, adx_value,
         f"📈 RSI: {round(float(rsi_value), 2)}\n"
         f"🔥 ADX: {round(float(adx_value), 2)}\n"
         f"🕒 Time: {candle_time}\n"
-        f"📦 Daily Signals: {signals_today + 1}/{MAX_SIGNALS_PER_DAY}\n\n"
         f"{risk_note}"
     )
 
@@ -319,21 +323,13 @@ def build_signal(symbol, bonus=False):
         signal_type = "MAIN"
 
     long_cond = (
-        bullish_cross
-        and mid_bull
-        and high_bull
-        and strong_trend
-        and not_overextended_long
-        and volatility_ok
+        bullish_cross and mid_bull and high_bull and
+        strong_trend and not_overextended_long and volatility_ok
     )
 
     short_cond = (
-        bearish_cross
-        and mid_bear
-        and high_bear
-        and strong_trend
-        and not_overextended_short
-        and volatility_ok
+        bearish_cross and mid_bear and high_bear and
+        strong_trend and not_overextended_short and volatility_ok
     )
 
     if long_cond:
@@ -403,6 +399,7 @@ def build_forced_signal(symbol):
 
 def update_open_trades():
     to_remove = []
+
     for symbol, trade in list(open_trades.items()):
         try:
             df = get_data(symbol, LOW_TF, 5)
@@ -444,6 +441,7 @@ def update_open_trades():
                         f"🎯 Exit: {round(trade['tp'], 4)}"
                     )
                     to_remove.append(symbol)
+
         except Exception as e:
             print("Trade update error:", symbol, e)
 
@@ -471,8 +469,70 @@ def handle_commands():
             send(open_trades_text())
 
 
+def should_send_scheduled_now(local_now, hour, minute):
+    slot_key = f"{local_now.date()}-{hour:02d}:{minute:02d}"
+    if slot_key in sent_scheduled_slots:
+        return False, slot_key
+
+    current_minutes = local_now.hour * 60 + local_now.minute
+    target_minutes = hour * 60 + minute
+
+    if target_minutes <= current_minutes < target_minutes + SCHEDULE_WINDOW_MINUTES:
+        return True, slot_key
+
+    return False, slot_key
+
+
+def maybe_send_scheduled_update(local_now):
+    global signals_today
+
+    for hour, minute in SCHEDULED_TIMES:
+        should_send, slot_key = should_send_scheduled_now(local_now, hour, minute)
+        if not should_send:
+            continue
+
+        send(scheduled_update_text())
+
+        if signals_today == 0 and bonus_signals_today == 0 and FORCED_SIGNAL_SYMBOL not in open_trades:
+            try:
+                result = build_forced_signal(FORCED_SIGNAL_SYMBOL)
+                signal_key, msg, side, candle_time, price, sl, tp, signal_type = result
+                forced_key = f"{FORCED_SIGNAL_SYMBOL}-FORCED-{candle_time}"
+
+                if last_signal_by_symbol.get(FORCED_SIGNAL_SYMBOL + "_forced") != forced_key:
+                    send(msg)
+                    last_signal_by_symbol[FORCED_SIGNAL_SYMBOL + "_forced"] = forced_key
+                    open_trades[FORCED_SIGNAL_SYMBOL] = {
+                        "side": side,
+                        "entry": price,
+                        "sl": sl,
+                        "tp": tp,
+                        "entry_time": candle_time,
+                        "signal_type": signal_type,
+                    }
+                    log_new_trade(FORCED_SIGNAL_SYMBOL, side, candle_time, price, sl, tp, signal_type)
+                    signals_today += 1
+
+            except Exception as forced_error:
+                print("forced signal error:", forced_error)
+
+        sent_scheduled_slots.add(slot_key)
+
+
+def maybe_send_5h_update(now):
+    global last_5h_update
+
+    bucket = now.strftime("%Y-%m-%d-") + str(now.hour // 5)
+    if bucket == last_5h_update:
+        return
+
+    if 0 <= now.minute < SCHEDULE_WINDOW_MINUTES:
+        send(summarize_performance())
+        last_5h_update = bucket
+
+
 def main():
-    global signals_today, bonus_signals_today, last_no_signal_day, last_scheduled_key, last_5h_update
+    global signals_today, bonus_signals_today, last_no_signal_day
 
     ensure_trades_file()
     send("🚀 VIP signal bot is now live.")
@@ -482,107 +542,76 @@ def main():
             now = datetime.now(timezone.utc)
             local_now = now.astimezone(LOCAL_TZ)
 
-            if not (START_HOUR <= local_now.hour < END_HOUR):
-                time.sleep(60)
-                continue
-
-            reset_daily_counter()
+            reset_daily_counter(local_now)
             handle_commands()
-            update_open_trades()
 
-            if signals_today < MAX_SIGNALS_PER_DAY:
-                for symbol in SYMBOLS:
-                    if signals_today >= MAX_SIGNALS_PER_DAY:
-                        break
-                    if symbol in open_trades:
-                        continue
+            if START_HOUR <= local_now.hour < END_HOUR:
+                update_open_trades()
 
-                    try:
-                        result = build_signal(symbol, bonus=False)
-                        if result:
-                            signal_key, msg, side, candle_time, price, sl, tp, signal_type = result
-                            if last_signal_by_symbol.get(symbol) != signal_key:
-                                send(msg)
-                                last_signal_by_symbol[symbol] = signal_key
-                                open_trades[symbol] = {
-                                    "side": side,
-                                    "entry": price,
-                                    "sl": sl,
-                                    "tp": tp,
-                                    "entry_time": candle_time,
-                                    "signal_type": signal_type,
-                                }
-                                log_new_trade(symbol, side, candle_time, price, sl, tp, signal_type)
-                                signals_today += 1
-                    except Exception as symbol_error:
-                        print(symbol, "main signal error:", symbol_error)
+                if signals_today < MAX_SIGNALS_PER_DAY:
+                    for symbol in SYMBOLS:
+                        if signals_today >= MAX_SIGNALS_PER_DAY:
+                            break
+                        if symbol in open_trades:
+                            continue
 
-            if bonus_signals_today < MAX_BONUS_SIGNALS_PER_DAY:
-                for symbol in SYMBOLS:
-                    if bonus_signals_today >= MAX_BONUS_SIGNALS_PER_DAY:
-                        break
-                    if symbol in open_trades:
-                        continue
-
-                    try:
-                        result = build_signal(symbol, bonus=True)
-                        if result:
-                            signal_key, msg, side, candle_time, price, sl, tp, signal_type = result
-                            bonus_key = f"{symbol}-BONUS-{candle_time}"
-                            if last_signal_by_symbol.get(symbol + "_bonus") != bonus_key:
-                                send(msg)
-                                last_signal_by_symbol[symbol + "_bonus"] = bonus_key
-                                open_trades[symbol] = {
-                                    "side": side,
-                                    "entry": price,
-                                    "sl": sl,
-                                    "tp": tp,
-                                    "entry_time": candle_time,
-                                    "signal_type": signal_type,
-                                }
-                                log_new_trade(symbol, side, candle_time, price, sl, tp, signal_type)
-                                bonus_signals_today += 1
-                    except Exception as symbol_error:
-                        print(symbol, "bonus signal error:", symbol_error)
-
-            scheduled_key = local_now.strftime("%Y-%m-%d-%H-%M")
-            if (local_now.hour, local_now.minute) in SCHEDULED_TIMES:
-                if last_scheduled_key != scheduled_key:
-                    send(scheduled_update_text())
-
-                    if signals_today == 0 and FORCED_SIGNAL_SYMBOL not in open_trades:
                         try:
-                            result = build_forced_signal(FORCED_SIGNAL_SYMBOL)
-                            signal_key, msg, side, candle_time, price, sl, tp, signal_type = result
-                            forced_key = f"{FORCED_SIGNAL_SYMBOL}-FORCED-{candle_time}"
-                            if last_signal_by_symbol.get(FORCED_SIGNAL_SYMBOL + "_forced") != forced_key:
-                                send(msg)
-                                last_signal_by_symbol[FORCED_SIGNAL_SYMBOL + "_forced"] = forced_key
-                                open_trades[FORCED_SIGNAL_SYMBOL] = {
-                                    "side": side,
-                                    "entry": price,
-                                    "sl": sl,
-                                    "tp": tp,
-                                    "entry_time": candle_time,
-                                    "signal_type": signal_type,
-                                }
-                                log_new_trade(FORCED_SIGNAL_SYMBOL, side, candle_time, price, sl, tp, signal_type)
-                                signals_today += 1
-                        except Exception as forced_error:
-                            print("forced signal error:", forced_error)
+                            result = build_signal(symbol, bonus=False)
+                            if result:
+                                signal_key, msg, side, candle_time, price, sl, tp, signal_type = result
+                                if last_signal_by_symbol.get(symbol) != signal_key:
+                                    send(msg)
+                                    last_signal_by_symbol[symbol] = signal_key
+                                    open_trades[symbol] = {
+                                        "side": side,
+                                        "entry": price,
+                                        "sl": sl,
+                                        "tp": tp,
+                                        "entry_time": candle_time,
+                                        "signal_type": signal_type,
+                                    }
+                                    log_new_trade(symbol, side, candle_time, price, sl, tp, signal_type)
+                                    signals_today += 1
+                        except Exception as symbol_error:
+                            print(symbol, "main signal error:", symbol_error)
 
-                    last_scheduled_key = scheduled_key
+                if bonus_signals_today < MAX_BONUS_SIGNALS_PER_DAY:
+                    for symbol in SYMBOLS:
+                        if bonus_signals_today >= MAX_BONUS_SIGNALS_PER_DAY:
+                            break
+                        if symbol in open_trades:
+                            continue
 
-            five_hour_bucket = now.strftime("%Y-%m-%d-") + str(now.hour // 5)
-            if now.minute == 0 and last_5h_update != five_hour_bucket:
-                send(summarize_performance())
-                last_5h_update = five_hour_bucket
+                        try:
+                            result = build_signal(symbol, bonus=True)
+                            if result:
+                                signal_key, msg, side, candle_time, price, sl, tp, signal_type = result
+                                bonus_key = f"{symbol}-BONUS-{candle_time}"
+                                if last_signal_by_symbol.get(symbol + "_bonus") != bonus_key:
+                                    send(msg)
+                                    last_signal_by_symbol[symbol + "_bonus"] = bonus_key
+                                    open_trades[symbol] = {
+                                        "side": side,
+                                        "entry": price,
+                                        "sl": sl,
+                                        "tp": tp,
+                                        "entry_time": candle_time,
+                                        "signal_type": signal_type,
+                                    }
+                                    log_new_trade(symbol, side, candle_time, price, sl, tp, signal_type)
+                                    bonus_signals_today += 1
+                        except Exception as symbol_error:
+                            print(symbol, "bonus signal error:", symbol_error)
 
-            today = now.date()
-            if now.hour == 23 and now.minute >= 55:
-                if signals_today == 0 and bonus_signals_today == 0 and last_no_signal_day != today:
+                maybe_send_scheduled_update(local_now)
+
+            maybe_send_5h_update(now)
+
+            today_local = local_now.date()
+            if local_now.hour == 21 and local_now.minute >= 55:
+                if signals_today == 0 and bonus_signals_today == 0 and last_no_signal_day != today_local:
                     send("📭 No signals today — market not clean")
-                    last_no_signal_day = today
+                    last_no_signal_day = today_local
 
         except Exception as e:
             print("Main loop error:", e)
