@@ -8,22 +8,20 @@ from zoneinfo import ZoneInfo
 TOKEN = os.environ["TOKEN"]
 CHAT_ID = os.environ["CHAT_ID"]
 
-SYMBOLS = [
-    "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT",
-    "XRPUSDT", "DOGEUSDT", "AVAXUSDT", "LINKUSDT"
-]
+# More aggressive coin list
+SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "DOGEUSDT", "AVAXUSDT"]
 
 LOW_TF = "15m"
 MID_TF = "30m"
 HIGH_TF = "1h"
-CHECK_EVERY_SECONDS = 60
-MAX_SIGNALS_PER_DAY = 5
-MAX_BONUS_SIGNALS_PER_DAY = 2
+CHECK_EVERY_SECONDS = 30
+MAX_SIGNALS_PER_DAY = 6
+MAX_BONUS_SIGNALS_PER_DAY = 3
 
-ATR_SL_MULTIPLIER = 1.3
-ATR_TP_MULTIPLIER = 2.6
-MIN_ADX = 10
-BONUS_MIN_ADX = 8
+ATR_SL_MULTIPLIER = 1.0
+ATR_TP_MULTIPLIER = 1.8
+MIN_ADX = 6
+BONUS_MIN_ADX = 4
 
 TRADES_FILE = "trades.csv"
 
@@ -263,22 +261,22 @@ def build_signal(symbol, bonus=False):
     bullish_cross = row["ema9"] > row["ema21"]
     bearish_cross = row["ema9"] < row["ema21"]
 
-    mid_bull = mid["close"] > mid["ema50"]
-    mid_bear = mid["close"] < mid["ema50"]
+    mid_bull = mid["ema9"] > mid["ema21"]
+    mid_bear = mid["ema9"] < mid["ema21"]
 
-    high_bull = high["close"] > high["ema50"]
-    high_bear = high["close"] < high["ema50"]
+    high_bull = high["ema9"] > high["ema21"]
+    high_bear = high["ema9"] < high["ema21"]
 
     if bonus:
         strong_trend = row["adx14"] >= BONUS_MIN_ADX
-        not_overextended_long = 35 <= row["rsi14"] <= 85
-        not_overextended_short = 15 <= row["rsi14"] <= 65
-        volatility_ok = (atr_val / price) >= 0.0005
+        not_overextended_long = 30 <= row["rsi14"] <= 90
+        not_overextended_short = 10 <= row["rsi14"] <= 70
+        volatility_ok = (atr_val / price) >= 0.0002
     else:
         strong_trend = row["adx14"] >= MIN_ADX
-        not_overextended_long = 40 <= row["rsi14"] <= 80
-        not_overextended_short = 20 <= row["rsi14"] <= 60
-        volatility_ok = (atr_val / price) >= 0.0007
+        not_overextended_long = 35 <= row["rsi14"] <= 85
+        not_overextended_short = 15 <= row["rsi14"] <= 65
+        volatility_ok = (atr_val / price) >= 0.0003
 
     long_cond = (
         bullish_cross
@@ -286,16 +284,15 @@ def build_signal(symbol, bonus=False):
         and high_bull
         and strong_trend
         and not_overextended_long
-        and row["close"] > row["ema21"]
         and volatility_ok
     )
+
     short_cond = (
         bearish_cross
         and mid_bear
         and high_bear
         and strong_trend
         and not_overextended_short
-        and row["close"] < row["ema21"]
         and volatility_ok
     )
 
