@@ -8,21 +8,23 @@ from zoneinfo import ZoneInfo
 TOKEN = os.environ["TOKEN"]
 CHAT_ID = os.environ["CHAT_ID"]
 
-SYMBOL = "BTC-USD"
 LOCAL_TZ = ZoneInfo("America/Toronto")
 
 START_HOUR = 9
 END_HOUR = 22
 
-MAX_SIGNALS_PER_DAY = 4
-MIN_WAIT = 10800  # 3 hours
+MAX_SIGNALS = 4
+BONUS_SIGNAL_LIMIT = 1
+MIN_WAIT = 7200  # 2 hours
 
-TP_PERCENT = 0.006   # 0.6%
-SL_PERCENT = 0.002   # 0.2%
+TP_PERCENT = 0.006
+SL_PERCENT = 0.002
+ENTRY_OFFSET = 0.001
 
 last_time = 0
-last_reset_day = None
 signals_today = 0
+bonus_sent = 0
+last_reset_day = None
 
 open_trade = None
 wins = 0
@@ -37,19 +39,19 @@ def send(msg):
 
 def get_data():
     r = requests.get(
-        f"https://api.exchange.coinbase.com/products/{SYMBOL}/candles",
-        params={"granularity": 60},
+        "https://api.kucoin.com/api/v1/market/candles",
+        params={"type": "1min", "symbol": "BTC-USDT"},
         timeout=20,
     )
     r.raise_for_status()
+    data = r.json()["data"]
 
-    df = pd.DataFrame(
-        r.json(),
-        columns=["time", "low", "high", "open", "close", "volume"]
-    )
-    df = df.sort_values("time").reset_index(drop=True)
+    df = pd.DataFrame(data, columns=[
+        "time","open","close","high","low","volume","turnover"
+    ])
+    df = df.iloc[::-1]
 
-    for col in ["open", "high", "low", "close"]:
+    for col in ["open","high","low","close"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
     return df
@@ -66,24 +68,21 @@ def rsi(series, n=12):
     rs = avg_gain / avg_loss
     return 100 - (100/(1+rs))
 
-def win_rate():
-    total = wins + losses
-    return round((wins / total) * 100, 1) if total else 0
-
-def stats_text():
-    total = wins + losses
-    return (
-        f"📊 Trades: {total} | Wins: {wins} | Losses: {losses} | WR: {win_rate()}%\n"
-        f"Signals Today: {signals_today}/{MAX_SIGNALS_PER_DAY}"
-    )
-
 def reset_day(now):
-    global last_reset_day, signals_today
+    global last_reset_day, signals_today, bonus_sent
     if last_reset_day != now.date():
         last_reset_day = now.date()
         signals_today = 0
+        bonus_sent = 0
 
-send("🚀 VIP SCALP BOT ACTIVE")
+def win_rate():
+    total = wins + losses
+    return round((wins/total)*100,1) if total else 0
+
+def stats():
+    return f"WR: {win_rate()}% | W: {wins} L: {losses}"
+
+send("🚀 VIP BOT ACTIVE (KUCOIN MODE)")
 last_time = time.time() - MIN_WAIT
 
 while True:
@@ -91,60 +90,11 @@ while True:
         now = datetime.now(LOCAL_TZ)
         reset_day(now)
 
-        df = get_data()
-        row = df.iloc[-1]
-
-        high_price = float(row["high"])
-        low_price = float(row["low"])
-
-        # ===== CHECK TRADE =====
-        if open_trade:
-            if open_trade["side"] == "LONG":
-                if low_price <= open_trade["sl"]:
-                    losses += 1
-                    send(
-                        f"❌ TRADE CLOSED\n\nBUY LONG\n"
-                        f"Entry: {round(open_trade['entry'],2)}\n"
-                        f"Exit: {round(open_trade['sl'],2)}\n"
-                        f"Result: SL HIT\n\n{stats_text()}"
-                    )
-                    open_trade = None
-
-                elif high_price >= open_trade["tp"]:
-                    wins += 1
-                    send(
-                        f"✅ TRADE CLOSED\n\nBUY LONG\n"
-                        f"Entry: {round(open_trade['entry'],2)}\n"
-                        f"Exit: {round(open_trade['tp'],2)}\n"
-                        f"Result: TP HIT\n\n{stats_text()}"
-                    )
-                    open_trade = None
-
-            else:
-                if high_price >= open_trade["sl"]:
-                    losses += 1
-                    send(
-                        f"❌ TRADE CLOSED\n\nSELL SHORT\n"
-                        f"Entry: {round(open_trade['entry'],2)}\n"
-                        f"Exit: {round(open_trade['sl'],2)}\n"
-                        f"Result: SL HIT\n\n{stats_text()}"
-                    )
-                    open_trade = None
-
-                elif low_price <= open_trade["tp"]:
-                    wins += 1
-                    send(
-                        f"✅ TRADE CLOSED\n\nSELL SHORT\n"
-                        f"Entry: {round(open_trade['entry'],2)}\n"
-                        f"Exit: {round(open_trade['tp'],2)}\n"
-                        f"Result: TP HIT\n\n{stats_text()}"
-                    )
-                    open_trade = None
-
         if not (START_HOUR <= now.hour < END_HOUR):
             time.sleep(60)
             continue
 
+        df = get_data()
         df["ema9"] = ema(df["close"], 9)
         df["ema21"] = ema(df["close"], 21)
         df["ema50"] = ema(df["close"], 50)
@@ -157,39 +107,32 @@ while True:
         trend_up = row["ema9"] > row["ema21"] > row["ema50"]
         trend_down = row["ema9"] < row["ema21"] < row["ema50"]
 
-        if trend_up and rsi_val > 54:
-            side = "LONG"
-            signal = "BUY LONG"
-            tp = price * (1 + TP_PERCENT)
-            sl = price * (1 - SL_PERCENT)
-            strength = "STRONG" if rsi_val > 57 else "NORMAL"
-
-        elif trend_down and rsi_val < 46:
-            side = "SHORT"
-            signal = "SELL SHORT"
-            tp = price * (1 - TP_PERCENT)
-            sl = price * (1 + SL_PERCENT)
-            strength = "STRONG" if rsi_val < 43 else "NORMAL"
-
-        else:
-            time.sleep(60)
-            continue
-
-        if open_trade is None and signals_today < MAX_SIGNALS_PER_DAY:
+        # ===== MAIN SIGNAL =====
+        if open_trade is None and signals_today < MAX_SIGNALS:
             if (time.time() - last_time) > MIN_WAIT:
 
-                rr = round(TP_PERCENT / SL_PERCENT, 1)
+                if trend_up and rsi_val > 54:
+                    side = "BUY LONG"
+                    tp = price * (1 + TP_PERCENT)
+                    sl = price * (1 - SL_PERCENT)
+
+                elif trend_down and rsi_val < 46:
+                    side = "SELL SHORT"
+                    tp = price * (1 - TP_PERCENT)
+                    sl = price * (1 + SL_PERCENT)
+
+                else:
+                    time.sleep(60)
+                    continue
 
                 msg = (
-                    f"🚨 VIP SCALP SIGNAL\n\n"
-                    f"BTCUSDT.P | {signal}\n\n"
-                    f"Entry: {round(price, 2)}\n"
-                    f"TP: {round(tp, 2)} (+{TP_PERCENT*100:.2f}%)\n"
-                    f"SL: {round(sl, 2)} (-{SL_PERCENT*100:.2f}%)\n"
-                    f"RR: 1:{rr}\n\n"
-                    f"Strength: {strength}\n"
-                    f"RSI: {round(rsi_val,1)}\n\n"
-                    f"{stats_text()}"
+                    f"🚨 VIP SIGNAL\n\n"
+                    f"BTCUSDT.P | {side}\n\n"
+                    f"Entry: USE CURRENT BTCC PRICE\n"
+                    f"TP: {TP_PERCENT*100:.2f}%\n"
+                    f"SL: {SL_PERCENT*100:.2f}%\n\n"
+                    f"{stats()}\n"
+                    f"{signals_today+1}/{MAX_SIGNALS} today"
                 )
 
                 send(msg)
@@ -204,9 +147,63 @@ while True:
                 last_time = time.time()
                 signals_today += 1
 
+        # ===== TRACK TRADE =====
+        if open_trade:
+            high = float(row["high"])
+            low = float(row["low"])
+
+            if open_trade["side"] == "BUY LONG":
+                if low <= open_trade["sl"]:
+                    losses += 1
+                    send(f"❌ SL HIT\n{stats()}")
+                    open_trade = None
+                elif high >= open_trade["tp"]:
+                    wins += 1
+                    send(f"✅ TP HIT\n{stats()}")
+                    open_trade = None
+
+            else:
+                if high >= open_trade["sl"]:
+                    losses += 1
+                    send(f"❌ SL HIT\n{stats()}")
+                    open_trade = None
+                elif low <= open_trade["tp"]:
+                    wins += 1
+                    send(f"✅ TP HIT\n{stats()}")
+                    open_trade = None
+
+        # ===== BONUS LIMIT SIGNAL =====
+        if bonus_sent < BONUS_SIGNAL_LIMIT and signals_today >= 2:
+            if trend_up:
+                entry = price * (1 - ENTRY_OFFSET)
+                tp = entry * (1 + TP_PERCENT)
+                sl = entry * (1 - SL_PERCENT)
+                side = "BUY LONG"
+
+            elif trend_down:
+                entry = price * (1 + ENTRY_OFFSET)
+                tp = entry * (1 - TP_PERCENT)
+                sl = entry * (1 + SL_PERCENT)
+                side = "SELL SHORT"
+            else:
+                time.sleep(60)
+                continue
+
+            msg = (
+                f"🎁 BONUS LIMIT SIGNAL\n\n"
+                f"BTCUSDT.P | {side}\n\n"
+                f"Entry: {round(entry,2)} (LIMIT)\n"
+                f"TP: {round(tp,2)}\n"
+                f"SL: {round(sl,2)}\n\n"
+                f"Set and wait trade"
+            )
+
+            send(msg)
+            bonus_sent += 1
+
     except Exception as e:
         try:
-            send(f"❌ ERROR: {str(e)}")
+            send(f"ERROR: {str(e)}")
         except:
             pass
 
