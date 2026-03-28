@@ -12,6 +12,10 @@ last_side = None
 last_time = 0
 MIN_WAIT = 540  # 9 minutes
 
+open_trade = None
+wins = 0
+losses = 0
+
 def send(msg):
     requests.post(
         f"https://api.telegram.org/bot{TOKEN}/sendMessage",
@@ -57,12 +61,84 @@ def atr(df, n=12):
     tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
     return tr.ewm(alpha=1 / n, adjust=False).mean()
 
-send("🚀 VIP BOT ACTIVE (2-5 TARGET)")
+def win_rate():
+    total = wins + losses
+    if total == 0:
+        return 0.0
+    return round((wins / total) * 100, 1)
+
+def stats_text():
+    total = wins + losses
+    return (
+        f"📊 STATS\n\n"
+        f"Trades Closed: {total}\n"
+        f"Wins: {wins}\n"
+        f"Losses: {losses}\n"
+        f"Win Rate: {win_rate()}%"
+    )
+
+send("🚀 VIP BOT ACTIVE (2-5 TARGET + STATS)")
 
 while True:
     try:
         df = get_data()
 
+        row = df.iloc[-1]
+        price = float(row["close"])
+        high_price = float(row["high"])
+        low_price = float(row["low"])
+
+        # check open trade first
+        if open_trade is not None:
+            if open_trade["side"] == "LONG":
+                if low_price <= open_trade["sl"]:
+                    losses += 1
+                    send(
+                        f"❌ TRADE CLOSED\n\n"
+                        f"💰 BTCUSDT.P\n"
+                        f"📊 BUY LONG\n"
+                        f"Result: SL HIT\n"
+                        f"Exit: {round(open_trade['sl'], 2)}\n\n"
+                        f"{stats_text()}"
+                    )
+                    open_trade = None
+                elif high_price >= open_trade["tp1"]:
+                    wins += 1
+                    send(
+                        f"✅ TRADE CLOSED\n\n"
+                        f"💰 BTCUSDT.P\n"
+                        f"📊 BUY LONG\n"
+                        f"Result: TP HIT\n"
+                        f"Exit: {round(open_trade['tp1'], 2)}\n\n"
+                        f"{stats_text()}"
+                    )
+                    open_trade = None
+
+            elif open_trade["side"] == "SHORT":
+                if high_price >= open_trade["sl"]:
+                    losses += 1
+                    send(
+                        f"❌ TRADE CLOSED\n\n"
+                        f"💰 BTCUSDT.P\n"
+                        f"📊 SELL SHORT\n"
+                        f"Result: SL HIT\n"
+                        f"Exit: {round(open_trade['sl'], 2)}\n\n"
+                        f"{stats_text()}"
+                    )
+                    open_trade = None
+                elif low_price <= open_trade["tp1"]:
+                    wins += 1
+                    send(
+                        f"✅ TRADE CLOSED\n\n"
+                        f"💰 BTCUSDT.P\n"
+                        f"📊 SELL SHORT\n"
+                        f"Result: TP HIT\n"
+                        f"Exit: {round(open_trade['tp1'], 2)}\n\n"
+                        f"{stats_text()}"
+                    )
+                    open_trade = None
+
+        # indicators
         df["ema9"] = ema(df["close"], 9)
         df["ema21"] = ema(df["close"], 21)
         df["ema50"] = ema(df["close"], 50)
@@ -101,7 +177,9 @@ while True:
             time.sleep(60)
             continue
 
-        if side != last_side or (time.time() - last_time) > MIN_WAIT:
+        can_send = side != last_side or (time.time() - last_time) > MIN_WAIT
+
+        if can_send and open_trade is None:
             msg = (
                 f"🚨 VIP SIGNAL 🚨\n\n"
                 f"💰 BTCUSDT.P\n"
@@ -113,10 +191,20 @@ while True:
                 f"🛑 SL: {round(sl, 2)}\n"
                 f"━━━━━━━━━━━━━━\n"
                 f"📈 RSI: {round(rsi_val, 1)}\n"
-                f"🔥 Strength: {strength}"
+                f"🔥 Strength: {strength}\n\n"
+                f"{stats_text()}"
             )
 
             send(msg)
+
+            open_trade = {
+                "side": side,
+                "entry": price,
+                "tp1": tp1,
+                "tp2": tp2,
+                "sl": sl
+            }
+
             last_side = side
             last_time = time.time()
 
