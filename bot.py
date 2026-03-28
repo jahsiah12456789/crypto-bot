@@ -15,7 +15,10 @@ START_HOUR = 9
 END_HOUR = 22
 
 MAX_SIGNALS_PER_DAY = 4
-MIN_WAIT = 10800  # 3 hours between signals
+MIN_WAIT = 10800  # 3 hours between new signals
+
+TP_PERCENT = 0.006   # 0.6%
+SL_PERCENT = 0.002   # 0.2%
 
 last_side = None
 last_time = 0
@@ -64,13 +67,6 @@ def rsi(series, n=12):
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
-def atr(df, n=12):
-    hl = df["high"] - df["low"]
-    hc = (df["high"] - df["close"].shift()).abs()
-    lc = (df["low"] - df["close"].shift()).abs()
-    tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
-    return tr.ewm(alpha=1 / n, adjust=False).mean()
-
 def win_rate():
     total = wins + losses
     if total == 0:
@@ -95,7 +91,8 @@ def reset_day_if_needed(now_local):
         last_reset_day = today
         signals_today = 0
 
-send("🚀 VIP BOT ACTIVE (SPREAD OUT MODE)")
+send("🚀 VIP BOT ACTIVE (PERCENT TP/SL MODE)")
+last_time = time.time() - MIN_WAIT
 
 while True:
     try:
@@ -108,7 +105,7 @@ while True:
         high_price = float(row["high"])
         low_price = float(row["low"])
 
-        # check open trade first
+        # ===== Check open trade first =====
         if open_trade is not None:
             if open_trade["side"] == "LONG":
                 if low_price <= open_trade["sl"]:
@@ -160,22 +157,20 @@ while True:
                     )
                     open_trade = None
 
-        # only generate new signals during session
+        # ===== Only generate signals during session =====
         if not (START_HOUR <= now_local.hour < END_HOUR):
             time.sleep(60)
             continue
 
-        # indicators
+        # ===== Indicators =====
         df["ema9"] = ema(df["close"], 9)
         df["ema21"] = ema(df["close"], 21)
         df["ema50"] = ema(df["close"], 50)
         df["rsi"] = rsi(df["close"], 12)
-        df["atr"] = atr(df, 12)
 
         row = df.iloc[-1]
         price = float(row["close"])
         rsi_val = float(row["rsi"])
-        atr_val = float(row["atr"])
 
         trend_up = row["ema9"] > row["ema21"] and row["ema21"] > row["ema50"]
         trend_down = row["ema9"] < row["ema21"] and row["ema21"] < row["ema50"]
@@ -183,19 +178,19 @@ while True:
         if trend_up and rsi_val > 54:
             side = "LONG"
             signal = "BUY LONG"
-            entry_low = price - atr_val * 0.25
-            entry_high = price + atr_val * 0.25
-            tp = price + atr_val * 2.2
-            sl = price - atr_val * 1.0
+            entry_low = price * 0.999
+            entry_high = price * 1.001
+            tp = price * (1 + TP_PERCENT)
+            sl = price * (1 - SL_PERCENT)
             strength = "STRONG" if rsi_val > 57 else "NORMAL"
 
         elif trend_down and rsi_val < 46:
             side = "SHORT"
             signal = "SELL SHORT"
-            entry_low = price - atr_val * 0.25
-            entry_high = price + atr_val * 0.25
-            tp = price - atr_val * 2.2
-            sl = price + atr_val * 1.0
+            entry_low = price * 0.999
+            entry_high = price * 1.001
+            tp = price * (1 - TP_PERCENT)
+            sl = price * (1 + SL_PERCENT)
             strength = "STRONG" if rsi_val < 43 else "NORMAL"
 
         else:
@@ -216,8 +211,8 @@ while True:
                 f"📊 {signal}\n"
                 f"━━━━━━━━━━━━━━\n"
                 f"📍 Entry Zone: {round(entry_low, 2)} - {round(entry_high, 2)}\n"
-                f"🎯 TP: {round(tp, 2)}\n"
-                f"🛑 SL: {round(sl, 2)}\n"
+                f"🎯 TP: {round(tp, 2)} ({round(TP_PERCENT * 100, 2)}%)\n"
+                f"🛑 SL: {round(sl, 2)} ({round(SL_PERCENT * 100, 2)}%)\n"
                 f"━━━━━━━━━━━━━━\n"
                 f"📈 RSI: {round(rsi_val, 1)}\n"
                 f"🔥 Strength: {strength}\n\n"
