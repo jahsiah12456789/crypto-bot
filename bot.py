@@ -12,6 +12,8 @@ LOCAL_TZ = ZoneInfo("America/Toronto")
 SYMBOL = "BTCUSDT"
 
 last_side = None
+last_signal_time = 0
+MIN_SECONDS_BETWEEN_SIGNALS = 180  # 3 min
 
 def send(msg):
     r = requests.post(
@@ -43,6 +45,15 @@ def get_data():
 def ema(series, n):
     return series.ewm(span=n, adjust=False).mean()
 
+def rsi(series, n=10):
+    delta = series.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1 / n, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / n, adjust=False).mean()
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
 def atr(df, n=14):
     hl = df["high"] - df["low"]
     hc = (df["high"] - df["close"].shift()).abs()
@@ -50,7 +61,7 @@ def atr(df, n=14):
     tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
     return tr.ewm(alpha=1 / n, adjust=False).mean()
 
-send("🚀 SIGNAL BOT LIVE")
+send("🚀 BTC VIP BOT LIVE")
 
 while True:
     try:
@@ -60,32 +71,44 @@ while True:
         df = get_data()
         df["ema9"] = ema(df["close"], 9)
         df["ema21"] = ema(df["close"], 21)
+        df["rsi10"] = rsi(df["close"], 10)
         df["atr14"] = atr(df)
 
         row = df.iloc[-1]
         price = float(row["close"])
         atr_val = float(row["atr14"])
+        rsi_val = float(row["rsi10"])
 
         if row["ema9"] > row["ema21"]:
             side = "LONG"
             tp = price + atr_val * 1.2
             sl = price - atr_val * 0.8
+            signal_text = "BUY LONG"
         else:
             side = "SHORT"
             tp = price - atr_val * 1.2
             sl = price + atr_val * 0.8
+            signal_text = "SELL SHORT"
 
-        if side != last_side:
+        flipped = side != last_side
+        time_ok = (time.time() - last_signal_time) >= MIN_SECONDS_BETWEEN_SIGNALS
+
+        strength = "STRONG" if ((side == "LONG" and rsi_val > 55) or (side == "SHORT" and rsi_val < 45)) else "ACTIVE"
+
+        if flipped or time_ok:
             msg = (
-                f"🚨 VIP SIGNAL\n\n"
+                f"🚨 BTC VIP SIGNAL\n\n"
                 f"Symbol: {SYMBOL}\n"
-                f"Signal: {'BUY LONG' if side == 'LONG' else 'SELL SHORT'}\n"
+                f"Signal: {signal_text}\n"
+                f"Strength: {strength}\n"
                 f"Entry: {round(price, 2)}\n"
                 f"TP: {round(tp, 2)}\n"
-                f"SL: {round(sl, 2)}"
+                f"SL: {round(sl, 2)}\n"
+                f"RSI: {round(rsi_val, 2)}"
             )
             send(msg)
             last_side = side
+            last_signal_time = time.time()
 
     except Exception as e:
         print("ERROR:", e)
