@@ -2,15 +2,25 @@ import os
 import time
 import requests
 import pandas as pd
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 TOKEN = os.environ["TOKEN"]
 CHAT_ID = os.environ["CHAT_ID"]
 
 SYMBOL = "BTC-USD"
+LOCAL_TZ = ZoneInfo("America/Toronto")
+
+START_HOUR = 9
+END_HOUR = 22
+
+MAX_SIGNALS_PER_DAY = 4
+MIN_WAIT = 10800  # 3 hours between signals
 
 last_side = None
 last_time = 0
-MIN_WAIT = 540  # 9 minutes
+last_reset_day = None
+signals_today = 0
 
 open_trade = None
 wins = 0
@@ -74,17 +84,27 @@ def stats_text():
         f"Trades Closed: {total}\n"
         f"Wins: {wins}\n"
         f"Losses: {losses}\n"
-        f"Win Rate: {win_rate()}%"
+        f"Win Rate: {win_rate()}%\n"
+        f"Signals Today: {signals_today}/{MAX_SIGNALS_PER_DAY}"
     )
 
-send("🚀 VIP BOT ACTIVE (2-5 TARGET + STATS)")
+def reset_day_if_needed(now_local):
+    global last_reset_day, signals_today
+    today = now_local.date()
+    if last_reset_day != today:
+        last_reset_day = today
+        signals_today = 0
+
+send("🚀 VIP BOT ACTIVE (SPREAD OUT MODE)")
 
 while True:
     try:
+        now_local = datetime.now(LOCAL_TZ)
+        reset_day_if_needed(now_local)
+
         df = get_data()
 
         row = df.iloc[-1]
-        price = float(row["close"])
         high_price = float(row["high"])
         low_price = float(row["low"])
 
@@ -102,14 +122,15 @@ while True:
                         f"{stats_text()}"
                     )
                     open_trade = None
-                elif high_price >= open_trade["tp1"]:
+
+                elif high_price >= open_trade["tp"]:
                     wins += 1
                     send(
                         f"✅ TRADE CLOSED\n\n"
                         f"💰 BTCUSDT.P\n"
                         f"📊 BUY LONG\n"
-                        f"Result: TP HIT\n"
-                        f"Exit: {round(open_trade['tp1'], 2)}\n\n"
+                        f"Result: FULL TP HIT\n"
+                        f"Exit: {round(open_trade['tp'], 2)}\n\n"
                         f"{stats_text()}"
                     )
                     open_trade = None
@@ -126,17 +147,23 @@ while True:
                         f"{stats_text()}"
                     )
                     open_trade = None
-                elif low_price <= open_trade["tp1"]:
+
+                elif low_price <= open_trade["tp"]:
                     wins += 1
                     send(
                         f"✅ TRADE CLOSED\n\n"
                         f"💰 BTCUSDT.P\n"
                         f"📊 SELL SHORT\n"
-                        f"Result: TP HIT\n"
-                        f"Exit: {round(open_trade['tp1'], 2)}\n\n"
+                        f"Result: FULL TP HIT\n"
+                        f"Exit: {round(open_trade['tp'], 2)}\n\n"
                         f"{stats_text()}"
                     )
                     open_trade = None
+
+        # only generate new signals during session
+        if not (START_HOUR <= now_local.hour < END_HOUR):
+            time.sleep(60)
+            continue
 
         # indicators
         df["ema9"] = ema(df["close"], 9)
@@ -158,8 +185,7 @@ while True:
             signal = "BUY LONG"
             entry_low = price - atr_val * 0.25
             entry_high = price + atr_val * 0.25
-            tp1 = price + atr_val * 1.4
-            tp2 = price + atr_val * 2.2
+            tp = price + atr_val * 2.2
             sl = price - atr_val * 1.0
             strength = "STRONG" if rsi_val > 57 else "NORMAL"
 
@@ -168,8 +194,7 @@ while True:
             signal = "SELL SHORT"
             entry_low = price - atr_val * 0.25
             entry_high = price + atr_val * 0.25
-            tp1 = price - atr_val * 1.4
-            tp2 = price - atr_val * 2.2
+            tp = price - atr_val * 2.2
             sl = price + atr_val * 1.0
             strength = "STRONG" if rsi_val < 43 else "NORMAL"
 
@@ -177,17 +202,21 @@ while True:
             time.sleep(60)
             continue
 
-        can_send = side != last_side or (time.time() - last_time) > MIN_WAIT
+        enough_time_passed = (time.time() - last_time) > MIN_WAIT
+        can_send = (
+            open_trade is None and
+            signals_today < MAX_SIGNALS_PER_DAY and
+            enough_time_passed
+        )
 
-        if can_send and open_trade is None:
+        if can_send:
             msg = (
                 f"🚨 VIP SIGNAL 🚨\n\n"
                 f"💰 BTCUSDT.P\n"
                 f"📊 {signal}\n"
                 f"━━━━━━━━━━━━━━\n"
                 f"📍 Entry Zone: {round(entry_low, 2)} - {round(entry_high, 2)}\n"
-                f"🎯 TP1: {round(tp1, 2)}\n"
-                f"🎯 TP2: {round(tp2, 2)}\n"
+                f"🎯 TP: {round(tp, 2)}\n"
                 f"🛑 SL: {round(sl, 2)}\n"
                 f"━━━━━━━━━━━━━━\n"
                 f"📈 RSI: {round(rsi_val, 1)}\n"
@@ -200,13 +229,13 @@ while True:
             open_trade = {
                 "side": side,
                 "entry": price,
-                "tp1": tp1,
-                "tp2": tp2,
+                "tp": tp,
                 "sl": sl
             }
 
             last_side = side
             last_time = time.time()
+            signals_today += 1
 
     except Exception as e:
         try:
