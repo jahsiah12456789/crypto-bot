@@ -5,11 +5,12 @@ import pandas as pd
 
 TOKEN = os.environ["TOKEN"]
 CHAT_ID = os.environ["CHAT_ID"]
-SYMBOL = "BTCUSDT"
+
+PRODUCT_ID = "BTC-USD"
 
 last_side = None
 last_signal_time = 0
-MIN_SECONDS_BETWEEN_SIGNALS = 180  # 3 minutes
+MIN_SECONDS_BETWEEN_SIGNALS = 180  # 3 min
 
 def send(msg):
     r = requests.post(
@@ -21,19 +22,21 @@ def send(msg):
 
 def get_data():
     r = requests.get(
-        "https://api.binance.com/api/v3/klines",
-        params={"symbol": SYMBOL, "interval": "1m", "limit": 100},
+        f"https://api.exchange.coinbase.com/products/{PRODUCT_ID}/candles",
+        params={"granularity": 60},
         timeout=20,
+        headers={"Accept": "application/json"},
     )
     r.raise_for_status()
 
-    df = pd.DataFrame(r.json())
-    df = df.iloc[:, :6]
-    df.columns = ["time", "open", "high", "low", "close", "volume"]
+    data = r.json()
+    # Coinbase candles: [time, low, high, open, close, volume]
+    df = pd.DataFrame(data, columns=["time", "low", "high", "open", "close", "volume"])
 
     for col in ["open", "high", "low", "close", "volume"]:
-        df[col] = pd.to_numeric(df[col])
+        df[col] = pd.to_numeric(df[col], errors="coerce")
 
+    df = df.sort_values("time").reset_index(drop=True)
     return df
 
 def ema(series, n):
@@ -55,7 +58,7 @@ def atr(df, n=14):
     tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
     return tr.ewm(alpha=1 / n, adjust=False).mean()
 
-send("🚀 BTC VIP BOT LIVE")
+send("🚀 BTC VIP BOT LIVE (COINBASE DATA)")
 
 while True:
     try:
@@ -89,7 +92,8 @@ while True:
         if flipped or time_ok:
             msg = (
                 f"🚨 BTC VIP SIGNAL\n\n"
-                f"Symbol: {SYMBOL}\n"
+                f"Source: Coinbase\n"
+                f"Symbol: BTCUSD\n"
                 f"Signal: {signal_text}\n"
                 f"Strength: {strength}\n"
                 f"Entry: {round(price, 2)}\n"
