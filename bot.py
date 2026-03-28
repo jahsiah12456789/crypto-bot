@@ -6,11 +6,11 @@ import pandas as pd
 TOKEN = os.environ["TOKEN"]
 CHAT_ID = os.environ["CHAT_ID"]
 
-PRODUCT_ID = "BTC-USD"
+SYMBOL = "BTCUSDT"
 
-last_side = None
 last_signal_time = 0
-MIN_SECONDS_BETWEEN_SIGNALS = 180  # 3 min
+last_side = None
+MIN_SECONDS_BETWEEN_SIGNALS = 300  # 5 min
 
 def send(msg):
     r = requests.post(
@@ -22,27 +22,39 @@ def send(msg):
 
 def get_data():
     r = requests.get(
-        f"https://api.exchange.coinbase.com/products/{PRODUCT_ID}/candles",
-        params={"granularity": 60},
+        "https://api.bybit.com/v5/market/kline",
+        params={
+            "category": "linear",
+            "symbol": SYMBOL,
+            "interval": "1",
+            "limit": 200
+        },
         timeout=20,
-        headers={"Accept": "application/json"},
     )
     r.raise_for_status()
-
     data = r.json()
-    # Coinbase candles: [time, low, high, open, close, volume]
-    df = pd.DataFrame(data, columns=["time", "low", "high", "open", "close", "volume"])
 
-    for col in ["open", "high", "low", "close", "volume"]:
+    if data.get("retCode") != 0:
+        raise Exception(f"Bybit API error: {data}")
+
+    rows = data["result"]["list"]
+
+    # Bybit returns newest first
+    df = pd.DataFrame(rows, columns=[
+        "startTime", "open", "high", "low", "close", "volume", "turnover"
+    ])
+
+    for col in ["open", "high", "low", "close", "volume", "turnover"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    df = df.sort_values("time").reset_index(drop=True)
+    df["startTime"] = pd.to_numeric(df["startTime"], errors="coerce")
+    df = df.sort_values("startTime").reset_index(drop=True)
     return df
 
 def ema(series, n):
     return series.ewm(span=n, adjust=False).mean()
 
-def rsi(series, n=10):
+def rsi(series, n=14):
     delta = series.diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
@@ -58,48 +70,70 @@ def atr(df, n=14):
     tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
     return tr.ewm(alpha=1 / n, adjust=False).mean()
 
-send("🚀 BTC VIP BOT LIVE (COINBASE DATA)")
+send("🚀 BTC VIP BOT LIVE (BYBIT BTCUSDT FEED)")
 
 while True:
     try:
         df = get_data()
+
         df["ema9"] = ema(df["close"], 9)
         df["ema21"] = ema(df["close"], 21)
-        df["rsi10"] = rsi(df["close"], 10)
+        df["ema50"] = ema(df["close"], 50)
+        df["rsi14"] = rsi(df["close"], 14)
         df["atr14"] = atr(df)
 
         row = df.iloc[-1]
         price = float(row["close"])
         atr_val = float(row["atr14"])
-        rsi_val = float(row["rsi10"])
+        rsi_val = float(row["rsi14"])
 
-        if row["ema9"] > row["ema21"]:
+        trend_up = row["ema9"] > row["ema21"] > row["ema50"]
+        trend_down = row["ema9"] < row["ema21"] < row["ema50"]
+
+        if trend_up and rsi_val > 52:
             side = "LONG"
-            tp = price + atr_val * 1.2
-            sl = price - atr_val * 0.8
             signal_text = "BUY LONG"
-        else:
+            tp = price + atr_val * 2.0
+            sl = price - atr_val * 1.0
+        elif trend_down and rsi_val < 48:
             side = "SHORT"
-            tp = price - atr_val * 1.2
-            sl = price + atr_val * 0.8
             signal_text = "SELL SHORT"
+            tp = price - atr_val * 2.0
+            sl = price + atr_val * 1.0
+        else:
+            # fallback so bot stays active
+            if row["ema9"] >= row["ema21"]:
+                side = "LONG"
+                signal_text = "BUY LONG"
+                tp = price + atr_val * 1.2
+                sl = price - atr_val * 0.8
+            else:
+                side = "SHORT"
+                signal_text = "SELL SHORT"
+                tp = price - atr_val * 1.2
+                sl = price + atr_val * 0.8
 
         flipped = side != last_side
         time_ok = (time.time() - last_signal_time) >= MIN_SECONDS_BETWEEN_SIGNALS
 
-        strength = "STRONG" if ((side == "LONG" and rsi_val > 55) or (side == "SHORT" and rsi_val < 45)) else "ACTIVE"
+        strength = "STRONG" if (
+            (side == "LONG" and rsi_val > 55) or
+            (side == "SHORT" and rsi_val < 45)
+        ) else "ACTIVE"
 
         if flipped or time_ok:
             msg = (
-                f"🚨 BTC VIP SIGNAL\n\n"
-                f"Source: Coinbase\n"
-                f"Symbol: BTCUSD\n"
-                f"Signal: {signal_text}\n"
-                f"Strength: {strength}\n"
-                f"Entry: {round(price, 2)}\n"
-                f"TP: {round(tp, 2)}\n"
-                f"SL: {round(sl, 2)}\n"
-                f"RSI: {round(rsi_val, 2)}"
+                f"🚨 VIP SIGNAL 🚨\n\n"
+                f"💰 BTCUSDT\n"
+                f"📊 {signal_text}\n"
+                f"━━━━━━━━━━━━━━\n"
+                f"📍 Entry: {round(price, 2)}\n"
+                f"🎯 TP: {round(tp, 2)}\n"
+                f"🛑 SL: {round(sl, 2)}\n"
+                f"━━━━━━━━━━━━━━\n"
+                f"📈 RSI: {round(rsi_val, 1)}\n"
+                f"🔥 Trend: {strength}\n"
+                f"📡 Feed: Bybit BTCUSDT"
             )
             send(msg)
             last_side = side
