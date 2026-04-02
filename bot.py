@@ -2,96 +2,93 @@ import os
 import time
 import requests
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 TOKEN = os.environ["TOKEN"]
 CHAT_ID = str(os.environ["CHAT_ID"])
 
+SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "DOGEUSDT", "AVAXUSDT"]
+
+LOW_TF = "15m"
+MID_TF = "30m"
+HIGH_TF = "1h"
+
+# faster bot
+CHECK_SIGNALS_EVERY_SECONDS = 5
+COMMAND_POLL_TIMEOUT = 1
+
+MAX_SIGNALS_PER_DAY = 6
+MAX_BONUS_SIGNALS_PER_DAY = 3
+
+ATR_SL_MULTIPLIER = 1.0
+ATR_TP_MULTIPLIER = 1.8
+MIN_ADX = 6
+BONUS_MIN_ADX = 4
+
+TRADES_FILE = "trades.csv"
+
 LOCAL_TZ = ZoneInfo("America/Toronto")
-SYMBOL = "BTC-USDT"
+SCHEDULED_TIMES = [(10, 30), (15, 30), (21, 0)]
+FORCED_SIGNAL_SYMBOL = "BTCUSDT"
 
 START_HOUR = 9
-END_HOUR = 22
-LOOP_SLEEP = 60
+END_HOUR = 22  # 10 PM Toronto
 
-CURRENT_MODE = "SAFE"   # SAFE / BALANCED / AGGRESSIVE
-BOT_PAUSED = False
-
-SAFE_MAX_VIP = 2
-SAFE_MAX_SCALP = 0
-SAFE_SCALP_PER_HOUR = 0
-
-BAL_MAX_VIP = 3
-BAL_MAX_SCALP = 1
-BAL_SCALP_PER_HOUR = 1
-
-AGG_MAX_VIP = 4
-AGG_MAX_SCALP = 2
-AGG_SCALP_PER_HOUR = 1
-
-MIN_WAIT_SAFE = 90 * 60
-MIN_WAIT_BAL = 60 * 60
-MIN_WAIT_AGG = 45 * 60
-
-LOSS_STREAK_PAUSE_CANDLES = 8
-SINGLE_LOSS_PAUSE_CANDLES = 3
-
-last_reset = None
+last_signal_by_symbol = {}
 signals_today = 0
-scalps_today = 0
-open_trade = None
-
-vip_wins = 0
-vip_losses = 0
-scalp_wins = 0
-scalp_losses = 0
-
-last_update_id = None
-last_error_text = ""
-last_error_time = 0
-
-scalp_hour_key = None
-scalp_count_this_hour = 0
-
-last_signal_ts = 0
-cooldown_candles = 0
-loss_streak = 0
-last_signal_side = None
+bonus_signals_today = 0
+last_reset_day = None
+open_trades = {}
+last_update_id = 0
+last_no_signal_day = None
+last_scheduled_key = None
+last_5h_update = None
+last_signal_scan_ts = 0.0
 
 
-def send(msg):
+def send(msg, chat_id=None):
+    target_chat = str(chat_id) if chat_id is not None else CHAT_ID
     requests.post(
         f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-        json={"chat_id": CHAT_ID, "text": msg},
+        json={"chat_id": target_chat, "text": msg},
         timeout=20,
     )
 
 
-def safe_send_error(msg):
-    global last_error_text, last_error_time
-    now_ts = time.time()
-    if msg == last_error_text and (now_ts - last_error_time) < 600:
-        return
-    last_error_text = msg
-    last_error_time = now_ts
-    try:
-        send(msg)
-    except Exception:
-        pass
-
-
-def get_updates(offset=None):
-    params = {"timeout": 1}
-    if offset is not None:
-        params["offset"] = offset
+def get_updates():
+    global last_update_id
+    url = f"https://api.telegram.org/bot{TOKEN}/getUpdates"
     r = requests.get(
-        f"https://api.telegram.org/bot{TOKEN}/getUpdates",
-        params=params,
-        timeout=10,
+        url,
+        params={"offset": last_update_id + 1, "timeout": COMMAND_POLL_TIMEOUT},
+        timeout=20,
     )
     r.raise_for_status()
-    return r.json()
+    data = r.json().get("result", [])
+    if data:
+        last_update_id = data[-1]["update_id"]
+    return data
+
+
+def get_data(symbol, interval, limit=300):
+    r = requests.get(
+        "https://api.binance.com/api/v3/klines",
+        params={"symbol": symbol, "interval": interval, "limit": limit},
+        timeout=20,
+    )
+    r.raise_for_status()
+    df = pd.DataFrame(
+        r.json(),
+        columns=[
+            "open_time", "open", "high", "low", "close", "volume",
+            "close_time", "qav", "trades", "tbav", "tqav", "ignore"
+        ],
+    )
+    for col in ["open", "high", "low", "close", "volume"]:
+        df[col] = pd.to_numeric(df[col])
+    df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
+    return df
 
 
 def ema(series, n):
@@ -104,541 +101,503 @@ def rsi(series, n=14):
     loss = -delta.clip(upper=0)
     avg_gain = gain.ewm(alpha=1 / n, adjust=False).mean()
     avg_loss = loss.ewm(alpha=1 / n, adjust=False).mean()
-    rs = avg_gain / avg_loss.replace(0, 1e-9)
+    rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
 
 def atr(df, n=14):
-    high_low = df["high"] - df["low"]
-    high_close = (df["high"] - df["close"].shift()).abs()
-    low_close = (df["low"] - df["close"].shift()).abs()
-    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    return tr.rolling(n).mean()
+    hl = df["high"] - df["low"]
+    hc = (df["high"] - df["close"].shift()).abs()
+    lc = (df["low"] - df["close"].shift()).abs()
+    tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
+    return tr.ewm(alpha=1 / n, adjust=False).mean()
 
 
-def wr(w, l):
-    total = w + l
-    return round((w / total) * 100, 1) if total else 0.0
+def adx(df, n=14):
+    up_move = df["high"].diff()
+    down_move = -df["low"].diff()
+
+    plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
+    minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
+
+    tr1 = df["high"] - df["low"]
+    tr2 = (df["high"] - df["close"].shift()).abs()
+    tr3 = (df["low"] - df["close"].shift()).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
+    atr_smoothed = tr.ewm(alpha=1 / n, adjust=False).mean()
+    plus_di = 100 * (plus_dm.ewm(alpha=1 / n, adjust=False).mean() / atr_smoothed)
+    minus_di = 100 * (minus_dm.ewm(alpha=1 / n, adjust=False).mean() / atr_smoothed)
+
+    dx = ((plus_di - minus_di).abs() / (plus_di + minus_di).abs()) * 100
+    return dx.ewm(alpha=1 / n, adjust=False).mean()
 
 
-def all_stats():
-    total_w = vip_wins + scalp_wins
-    total_l = vip_losses + scalp_losses
-    return f"Overall WR: {wr(total_w, total_l)}% | W:{total_w} L:{total_l}"
-
-
-def get_limits():
-    if CURRENT_MODE == "SAFE":
-        return {
-            "max_vip": SAFE_MAX_VIP,
-            "max_scalp": SAFE_MAX_SCALP,
-            "scalp_per_hour": SAFE_SCALP_PER_HOUR,
-            "min_wait": MIN_WAIT_SAFE,
-        }
-    if CURRENT_MODE == "AGGRESSIVE":
-        return {
-            "max_vip": AGG_MAX_VIP,
-            "max_scalp": AGG_MAX_SCALP,
-            "scalp_per_hour": AGG_SCALP_PER_HOUR,
-            "min_wait": MIN_WAIT_AGG,
-        }
-    return {
-        "max_vip": BAL_MAX_VIP,
-        "max_scalp": BAL_MAX_SCALP,
-        "scalp_per_hour": BAL_SCALP_PER_HOUR,
-        "min_wait": MIN_WAIT_BAL,
-    }
-
-
-def get_stats_message():
-    total_w = vip_wins + scalp_wins
-    total_l = vip_losses + scalp_losses
-    return (
-        f"📊 DXM ELITE STATS\n\n"
-        f"VIP -> WR: {wr(vip_wins, vip_losses)}% | W:{vip_wins} L:{vip_losses}\n"
-        f"SCALP -> WR: {wr(scalp_wins, scalp_losses)}% | W:{scalp_wins} L:{scalp_losses}\n"
-        f"OVERALL -> WR: {wr(total_w, total_l)}% | W:{total_w} L:{total_l}\n\n"
-        f"VIP Today: {signals_today}\n"
-        f"SCALP Today: {scalps_today}\n"
-        f"Loss Streak: {loss_streak}\n"
-        f"Cooldown Candles: {cooldown_candles}\n"
-        f"Mode: {CURRENT_MODE}\n"
-        f"Paused: {BOT_PAUSED}"
-    )
-
-
-def get_status_message():
-    limits = get_limits()
-    trade_text = "No open trade"
-    if open_trade:
-        trade_text = (
-            f"Open Trade: {open_trade['signal_type']} {open_trade['side']}\n"
-            f"Entry: {open_trade['entry']}\n"
-            f"TP: {open_trade['tp']}\n"
-            f"SL: {open_trade['sl']}"
-        )
-    return (
-        f"🤖 DXM ELITE STATUS\n\n"
-        f"Paused: {BOT_PAUSED}\n"
-        f"Mode: {CURRENT_MODE}\n"
-        f"VIP Used: {signals_today}/{limits['max_vip']}\n"
-        f"SCALP Used: {scalps_today}/{limits['max_scalp']}\n"
-        f"Scalp Hour Count: {scalp_count_this_hour}/{limits['scalp_per_hour']}\n"
-        f"Cooldown Candles: {cooldown_candles}\n"
-        f"Loss Streak: {loss_streak}\n\n"
-        f"{trade_text}\n\n"
-        f"{all_stats()}"
-    )
-
-
-def process_commands():
-    global last_update_id, BOT_PAUSED, CURRENT_MODE
-    global vip_wins, vip_losses, scalp_wins, scalp_losses
-    global signals_today, scalps_today, open_trade
-    global cooldown_candles, loss_streak
-
-    try:
-        data = get_updates(last_update_id + 1 if last_update_id is not None else None)
-        if not data.get("ok"):
-            return
-
-        for item in data.get("result", []):
-            last_update_id = item["update_id"]
-            message = item.get("message")
-            if not message:
-                continue
-
-            chat_id = str(message["chat"]["id"])
-            if chat_id != CHAT_ID:
-                continue
-
-            text = message.get("text", "").strip().lower()
-
-            if text == "/pause":
-                BOT_PAUSED = True
-                send("⏸️ Bot paused.")
-
-            elif text == "/resume":
-                BOT_PAUSED = False
-                send("▶️ Bot resumed.")
-
-            elif text == "/safe":
-                CURRENT_MODE = "SAFE"
-                send("🛡️ Mode changed to SAFE.")
-
-            elif text == "/balanced":
-                CURRENT_MODE = "BALANCED"
-                send("⚖️ Mode changed to BALANCED.")
-
-            elif text == "/aggressive":
-                CURRENT_MODE = "AGGRESSIVE"
-                send("🔥 Mode changed to AGGRESSIVE.")
-
-            elif text == "/mode":
-                limits = get_limits()
-                send(
-                    f"⚙️ CURRENT MODE\n\n"
-                    f"Mode: {CURRENT_MODE}\n"
-                    f"VIP Max/Day: {limits['max_vip']}\n"
-                    f"Scalp Max/Day: {limits['max_scalp']}\n"
-                    f"Scalp Max/Hour: {limits['scalp_per_hour']}\n"
-                    f"Min Wait: {int(limits['min_wait']/60)} min"
-                )
-
-            elif text == "/stats":
-                send(get_stats_message())
-
-            elif text == "/status":
-                send(get_status_message())
-
-            elif text == "/reset":
-                vip_wins = 0
-                vip_losses = 0
-                scalp_wins = 0
-                scalp_losses = 0
-                signals_today = 0
-                scalps_today = 0
-                open_trade = None
-                cooldown_candles = 0
-                loss_streak = 0
-                send("🔄 Stats reset. Trade cleared. Cooldown reset.")
-
-    except Exception as e:
-        safe_send_error(f"ERROR COMMANDS: {str(e)}")
-
-
-def get_data(tf):
-    r = requests.get(
-        "https://api.kucoin.com/api/v1/market/candles",
-        params={"type": tf, "symbol": SYMBOL},
-        timeout=20,
-    )
-    r.raise_for_status()
-    data = r.json()["data"]
-
-    df = pd.DataFrame(
-        data,
-        columns=["time", "open", "close", "high", "low", "volume", "turnover"]
-    )
-    df = df.iloc[::-1].reset_index(drop=True)
-
-    for col in ["open", "high", "low", "close", "volume"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    return df
-
-
-def reset_day(now):
-    global last_reset, signals_today, scalps_today
-    if last_reset != now.date():
-        last_reset = now.date()
-        signals_today = 0
-        scalps_today = 0
-        send(
-            f"📅 New Day Started\n\n"
-            f"VIP reset: 0\n"
-            f"Scalp reset: 0\n"
-            f"Mode: {CURRENT_MODE}"
-        )
-
-
-def reset_scalp_hour(now):
-    global scalp_hour_key, scalp_count_this_hour
-    hour_key = (now.date(), now.hour)
-    if scalp_hour_key != hour_key:
-        scalp_hour_key = hour_key
-        scalp_count_this_hour = 0
-
-
-def in_session(now):
-    return START_HOUR <= now.hour < END_HOUR
-
-
-def get_trend_df():
-    df = get_data("1hour")
-    df["ema20"] = ema(df["close"], 20)
+def add_indicators(df):
+    df = df.copy()
+    df["ema9"] = ema(df["close"], 9)
+    df["ema21"] = ema(df["close"], 21)
     df["ema50"] = ema(df["close"], 50)
-    df["ema100"] = ema(df["close"], 100)
-    df["atr"] = atr(df, 14)
+    df["ema200"] = ema(df["close"], 200)
+    df["rsi14"] = rsi(df["close"], 14)
+    df["atr14"] = atr(df, 14)
+    df["adx14"] = adx(df, 14)
     return df
 
 
-def get_entry_df():
-    df = get_data("15min")
-    df["ema20"] = ema(df["close"], 20)
-    df["ema50"] = ema(df["close"], 50)
-    df["rsi"] = rsi(df["close"], 14)
-    df["atr"] = atr(df, 14)
-    return df
+def ensure_trades_file():
+    if not os.path.exists(TRADES_FILE):
+        pd.DataFrame(
+            columns=[
+                "symbol", "side", "entry_time", "entry_price", "sl", "tp",
+                "exit_time", "exit_price", "status", "pnl_pct", "r_multiple",
+                "signal_type"
+            ]
+        ).to_csv(TRADES_FILE, index=False)
 
 
-def trend_state(trend_df):
-    row = trend_df.iloc[-1]
-    price = float(row["close"])
-    ema20_val = float(row["ema20"])
-    ema50_val = float(row["ema50"])
-    ema100_val = float(row["ema100"])
-    atr_val = float(row["atr"]) if pd.notna(row["atr"]) else price * 0.003
-
-    bullish = price > ema20_val > ema50_val > ema100_val
-    bearish = price < ema20_val < ema50_val < ema100_val
-
-    spread1 = abs(ema20_val - ema50_val) / price
-    spread2 = abs(ema50_val - ema100_val) / price
-    atr_ratio = atr_val / price
-
-    strong_trend = spread1 > 0.0015 and spread2 > 0.0015 and atr_ratio > 0.002
-
-    if bullish and strong_trend:
-        return "BULL_STRONG"
-    if bearish and strong_trend:
-        return "BEAR_STRONG"
-    if bullish:
-        return "BULL_WEAK"
-    if bearish:
-        return "BEAR_WEAK"
-    return "SIDEWAYS"
+def log_new_trade(symbol, side, entry_time, entry_price, sl, tp, signal_type):
+    df = pd.read_csv(TRADES_FILE)
+    df.loc[len(df)] = [
+        symbol, side, entry_time, entry_price, sl, tp,
+        "", "", "OPEN", "", "", signal_type
+    ]
+    df.to_csv(TRADES_FILE, index=False)
 
 
-def is_sideways(entry_df):
-    recent = entry_df.iloc[-8:]
-    if len(recent) < 8:
-        return True
-
-    price = float(recent.iloc[-1]["close"])
-    recent_high = float(recent["high"].max())
-    recent_low = float(recent["low"].min())
-    rng = (recent_high - recent_low) / price
-
-    ema20_val = float(recent.iloc[-1]["ema20"])
-    ema50_val = float(recent.iloc[-1]["ema50"])
-    ema_gap = abs(ema20_val - ema50_val) / price
-
-    atr_mean = recent["atr"].mean()
-    atr_ratio = float(atr_mean / price) if pd.notna(atr_mean) else 0.0
-
-    return rng < 0.0045 or ema_gap < 0.0012 or atr_ratio < 0.0018
-
-
-def strong_bull_breakout(entry_df):
-    row = entry_df.iloc[-1]
-    prev = entry_df.iloc[-2]
-    recent_high = entry_df["high"].iloc[-10:-2].max()
-    candle_range = row["high"] - row["low"]
-    body = abs(row["close"] - row["open"])
-    body_ratio = body / candle_range if candle_range > 0 else 0
-
-    return (
-        row["close"] > recent_high
-        and row["close"] > row["open"]
-        and row["rsi"] > 56
-        and row["close"] > row["ema20"] > row["ema50"]
-        and row["close"] > prev["high"]
-        and body_ratio > 0.6
-    )
-
-
-def strong_bear_breakdown(entry_df):
-    row = entry_df.iloc[-1]
-    prev = entry_df.iloc[-2]
-    recent_low = entry_df["low"].iloc[-10:-2].min()
-    candle_range = row["high"] - row["low"]
-    body = abs(row["close"] - row["open"])
-    body_ratio = body / candle_range if candle_range > 0 else 0
-
-    return (
-        row["close"] < recent_low
-        and row["close"] < row["open"]
-        and row["rsi"] < 44
-        and row["close"] < row["ema20"] < row["ema50"]
-        and row["close"] < prev["low"]
-        and body_ratio > 0.6
-    )
-
-
-def elite_vip_signal(entry_df, trend_label):
-    row = entry_df.iloc[-1]
-    price = float(row["close"])
-    atr_val = float(row["atr"]) if pd.notna(row["atr"]) else price * 0.003
-
-    if trend_label == "BULL_STRONG" and strong_bull_breakout(entry_df):
-        sl = price - (atr_val * 1.2)
-        tp = price + ((price - sl) * 1.8)
-        return "BUY LONG", price, tp, sl, "Elite Bull Breakout"
-
-    if trend_label == "BEAR_STRONG" and strong_bear_breakdown(entry_df):
-        sl = price + (atr_val * 1.2)
-        tp = price - ((sl - price) * 1.8)
-        return "SELL SHORT", price, tp, sl, "Elite Bear Breakdown"
-
-    return None
-
-
-def scalp_signal(entry_df, trend_label):
-    row = entry_df.iloc[-1]
-    prev = entry_df.iloc[-2]
-    price = float(row["close"])
-    ema20_val = float(row["ema20"])
-    r = float(row["rsi"])
-
-    close_to_ema = abs(price - ema20_val) / price < 0.0009
-
-    if CURRENT_MODE == "SAFE":
-        return None
-
-    if not close_to_ema:
-        return None
-
-    if trend_label in ["SIDEWAYS", "BULL_WEAK", "BEAR_WEAK"]:
-        if CURRENT_MODE == "BALANCED":
-            if 47 <= r <= 53:
-                if row["close"] > prev["high"]:
-                    return "BUY LONG", price, price * 1.0025, price * 0.9987, "Scalp Bounce"
-                if row["close"] < prev["low"]:
-                    return "SELL SHORT", price, price * 0.9975, price * 1.0013, "Scalp Reject"
-
-        if CURRENT_MODE == "AGGRESSIVE":
-            if 45 <= r <= 55:
-                if row["close"] > prev["close"]:
-                    return "BUY LONG", price, price * 1.003, price * 0.9985, "Scalp Bounce"
-                if row["close"] < prev["close"]:
-                    return "SELL SHORT", price, price * 0.997, price * 1.0015, "Scalp Reject"
-
-    return None
-
-
-def can_send_signal():
-    limits = get_limits()
-    enough_wait = (time.time() - last_signal_ts) >= limits["min_wait"]
-    return enough_wait and cooldown_candles <= 0
-
-
-def track(entry_df):
-    global open_trade
-    global vip_wins, vip_losses, scalp_wins, scalp_losses
-    global cooldown_candles, loss_streak
-
-    if not open_trade:
+def close_trade(symbol, exit_time, exit_price, status):
+    df = pd.read_csv(TRADES_FILE)
+    open_rows = df[(df["symbol"] == symbol) & (df["status"] == "OPEN")]
+    if open_rows.empty:
         return
 
-    row = entry_df.iloc[-1]
-    high = float(row["high"])
-    low = float(row["low"])
+    idx = open_rows.index[-1]
+    side = df.loc[idx, "side"]
+    entry = float(df.loc[idx, "entry_price"])
+    sl = float(df.loc[idx, "sl"])
 
-    hit_tp = False
-    hit_sl = False
-
-    if open_trade["side"] == "LONG":
-        if low <= open_trade["sl"]:
-            hit_sl = True
-        elif high >= open_trade["tp"]:
-            hit_tp = True
+    if side == "LONG":
+        pnl_pct = ((exit_price - entry) / entry) * 100
+        r_multiple = (exit_price - entry) / (entry - sl) if entry != sl else 0
     else:
-        if high >= open_trade["sl"]:
-            hit_sl = True
-        elif low <= open_trade["tp"]:
-            hit_tp = True
+        pnl_pct = ((entry - exit_price) / entry) * 100
+        r_multiple = (entry - exit_price) / (sl - entry) if entry != sl else 0
 
-    if hit_tp:
-        if open_trade["signal_type"] == "VIP":
-            vip_wins += 1
-        else:
-            scalp_wins += 1
+    df.loc[idx, "exit_time"] = exit_time
+    df.loc[idx, "exit_price"] = round(exit_price, 6)
+    df.loc[idx, "status"] = status
+    df.loc[idx, "pnl_pct"] = round(pnl_pct, 3)
+    df.loc[idx, "r_multiple"] = round(r_multiple, 3)
+    df.to_csv(TRADES_FILE, index=False)
 
-        loss_streak = 0
-        send(
-            f"✅ TP HIT\n\n"
-            f"Type: {open_trade['signal_type']}\n"
-            f"Side: {open_trade['side']}\n"
-            f"Setup: {open_trade['setup']}\n"
-            f"{all_stats()}"
+
+def summarize_performance():
+    df = pd.read_csv(TRADES_FILE)
+    closed = df[df["status"].isin(["TP", "SL"])]
+    open_count = len(df[df["status"] == "OPEN"])
+
+    if closed.empty:
+        return (
+            "📊 VIP STATS\n"
+            "━━━━━━━━━━━━━━\n"
+            f"Closed Trades: 0\n"
+            f"Open Trades: {open_count}\n"
+            "Win Rate: 0%\n"
+            "Total PnL %: 0%\n"
+            "Total R: 0"
         )
-        open_trade = None
 
-    elif hit_sl:
-        if open_trade["signal_type"] == "VIP":
-            vip_losses += 1
-        else:
-            scalp_losses += 1
+    wins = (closed["status"] == "TP").sum()
+    losses = (closed["status"] == "SL").sum()
+    total = len(closed)
+    win_rate = round((wins / total) * 100, 2) if total else 0
+    total_r = round(pd.to_numeric(closed["r_multiple"], errors="coerce").fillna(0).sum(), 2)
+    total_pnl = round(pd.to_numeric(closed["pnl_pct"], errors="coerce").fillna(0).sum(), 2)
 
-        loss_streak += 1
-        cooldown_candles = LOSS_STREAK_PAUSE_CANDLES if loss_streak >= 2 else SINGLE_LOSS_PAUSE_CANDLES
+    return (
+        "📊 VIP STATS\n"
+        "━━━━━━━━━━━━━━\n"
+        f"Closed Trades: {total}\n"
+        f"Open Trades: {open_count}\n"
+        f"Wins: {wins}\n"
+        f"Losses: {losses}\n"
+        f"Win Rate: {win_rate}%\n"
+        f"Total PnL %: {total_pnl}%\n"
+        f"Total R: {total_r}"
+    )
 
-        send(
-            f"❌ SL HIT\n\n"
-            f"Type: {open_trade['signal_type']}\n"
-            f"Side: {open_trade['side']}\n"
-            f"Setup: {open_trade['setup']}\n"
-            f"Loss Streak: {loss_streak}\n"
-            f"Cooldown Candles: {cooldown_candles}\n"
-            f"{all_stats()}"
+
+def open_trades_text():
+    if not open_trades:
+        return "No open trades."
+
+    lines = ["📂 OPEN TRADES"]
+    for symbol, t in open_trades.items():
+        lines.append(
+            f"{symbol} {t['side']} | {t['signal_type']} | "
+            f"Entry: {round(t['entry'], 4)} | "
+            f"SL: {round(t['sl'], 4)} | TP: {round(t['tp'], 4)}"
         )
-        open_trade = None
+    return "\n".join(lines)
 
 
-send("🚀 DXM ELITE BOT ACTIVE")
+def scheduled_update_text():
+    stats = summarize_performance()
+    opens = open_trades_text()
+    return f"📡 VIP MARKET UPDATE\n\n{stats}\n\n{opens}"
 
-while True:
-    try:
-        process_commands()
 
-        now = datetime.now(LOCAL_TZ)
-        reset_day(now)
-        reset_scalp_hour(now)
+def reset_daily_counter():
+    global signals_today, bonus_signals_today, last_reset_day
+    today = datetime.now(timezone.utc).date()
+    if last_reset_day != today:
+        signals_today = 0
+        bonus_signals_today = 0
+        last_reset_day = today
 
-        if BOT_PAUSED:
-            time.sleep(LOOP_SLEEP)
-            continue
 
-        if not in_session(now):
-            time.sleep(LOOP_SLEEP)
-            continue
+def format_signal_message(symbol, side, price, sl, tp, rr, rsi_value, adx_value, candle_time, signal_type):
+    emoji = "🟢" if side == "LONG" else "🔴"
+    action = "BUY" if side == "LONG" else "SELL"
 
-        trend_df = get_trend_df()
-        entry_df = get_entry_df()
+    if signal_type == "BONUS":
+        header = "🎁 BONUS SIGNAL"
+        risk_note = "⚠️ Slightly riskier setup. Manage risk tightly."
+    elif signal_type == "FORCED":
+        header = "⚠️ FORCED SIGNAL"
+        risk_note = "⚠️ Lower confidence. Use smaller size."
+    else:
+        header = "🚨 VIP SIGNAL ALERT 🚨"
+        risk_note = "⚠️ Manage risk properly."
 
-        track(entry_df)
+    return (
+        f"{header}\n\n"
+        f"{emoji} {symbol} — {action} {side}\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"📍 Entry: {round(price, 4)}\n"
+        f"🛑 Stop Loss: {round(sl, 4)}\n"
+        f"🎯 Take Profit: {round(tp, 4)}\n"
+        f"📊 Risk/Reward: {rr}\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"📈 RSI: {round(float(rsi_value), 2)}\n"
+        f"🔥 ADX: {round(float(adx_value), 2)}\n"
+        f"🕒 Time: {candle_time}\n"
+        f"📦 Daily Signals: {signals_today + 1}/{MAX_SIGNALS_PER_DAY}\n\n"
+        f"{risk_note}"
+    )
 
-        if cooldown_candles > 0 and open_trade is None:
-            cooldown_candles -= 1
-            time.sleep(LOOP_SLEEP)
-            continue
 
-        trend_label = trend_state(trend_df)
-        sideways = is_sideways(entry_df)
-        limits = get_limits()
+def build_signal(symbol, bonus=False):
+    low_df = add_indicators(get_data(symbol, LOW_TF))
+    mid_df = add_indicators(get_data(symbol, MID_TF))
+    high_df = add_indicators(get_data(symbol, HIGH_TF))
 
-        if not open_trade and can_send_signal():
-            # VIP
-            if signals_today < limits["max_vip"] and not sideways:
-                sig = elite_vip_signal(entry_df, trend_label)
-                if sig:
-                    side, entry, tp, sl, setup = sig
+    row = low_df.iloc[-2]
+    mid = mid_df.iloc[-2]
+    high = high_df.iloc[-2]
 
-                    # block same-side instant re-entry after weak market
-                    if last_signal_side == side:
-                        pass
+    price = float(row["close"])
+    candle_time = str(row["close_time"])
+    atr_val = float(row["atr14"])
 
+    bullish_cross = row["ema9"] > row["ema21"]
+    bearish_cross = row["ema9"] < row["ema21"]
+
+    mid_bull = mid["ema9"] > mid["ema21"]
+    mid_bear = mid["ema9"] < mid["ema21"]
+
+    high_bull = high["ema9"] > high["ema21"]
+    high_bear = high["ema9"] < high["ema21"]
+
+    if bonus:
+        strong_trend = row["adx14"] >= BONUS_MIN_ADX
+        not_overextended_long = 30 <= row["rsi14"] <= 90
+        not_overextended_short = 10 <= row["rsi14"] <= 70
+        volatility_ok = (atr_val / price) >= 0.0002
+        signal_type = "BONUS"
+    else:
+        strong_trend = row["adx14"] >= MIN_ADX
+        not_overextended_long = 35 <= row["rsi14"] <= 85
+        not_overextended_short = 15 <= row["rsi14"] <= 65
+        volatility_ok = (atr_val / price) >= 0.0003
+        signal_type = "MAIN"
+
+    long_cond = (
+        bullish_cross
+        and mid_bull
+        and high_bull
+        and strong_trend
+        and not_overextended_long
+        and volatility_ok
+    )
+
+    short_cond = (
+        bearish_cross
+        and mid_bear
+        and high_bear
+        and strong_trend
+        and not_overextended_short
+        and volatility_ok
+    )
+
+    if long_cond:
+        side = "LONG"
+        sl = price - atr_val * ATR_SL_MULTIPLIER
+        tp = price + atr_val * ATR_TP_MULTIPLIER
+    elif short_cond:
+        side = "SHORT"
+        sl = price + atr_val * ATR_SL_MULTIPLIER
+        tp = price - atr_val * ATR_TP_MULTIPLIER
+    else:
+        return None
+
+    rr = round(abs(tp - price) / abs(price - sl), 2) if price != sl else 0
+    signal_key = f"{side}-{candle_time}-{signal_type}"
+
+    msg = format_signal_message(
+        symbol=symbol,
+        side=side,
+        price=price,
+        sl=sl,
+        tp=tp,
+        rr=rr,
+        rsi_value=row["rsi14"],
+        adx_value=row["adx14"],
+        candle_time=candle_time,
+        signal_type=signal_type,
+    )
+
+    return signal_key, msg, side, candle_time, price, sl, tp, signal_type
+
+
+def build_forced_signal(symbol):
+    low_df = add_indicators(get_data(symbol, LOW_TF))
+    row = low_df.iloc[-2]
+
+    price = float(row["close"])
+    atr_val = float(row["atr14"])
+    candle_time = str(row["close_time"])
+
+    if row["ema9"] >= row["ema21"]:
+        side = "LONG"
+        sl = price - atr_val * 0.9
+        tp = price + atr_val * 1.4
+    else:
+        side = "SHORT"
+        sl = price + atr_val * 0.9
+        tp = price - atr_val * 1.4
+
+    rr = round(abs(tp - price) / abs(price - sl), 2) if price != sl else 0
+
+    msg = format_signal_message(
+        symbol=symbol,
+        side=side,
+        price=price,
+        sl=sl,
+        tp=tp,
+        rr=rr,
+        rsi_value=row["rsi14"],
+        adx_value=row["adx14"],
+        candle_time=candle_time,
+        signal_type="FORCED",
+    )
+
+    return f"{side}-{candle_time}-FORCED", msg, side, candle_time, price, sl, tp, "FORCED"
+
+
+def update_open_trades():
+    to_remove = []
+    for symbol, trade in list(open_trades.items()):
+        try:
+            df = get_data(symbol, LOW_TF, 5)
+            row = df.iloc[-2]
+            high = float(row["high"])
+            low = float(row["low"])
+
+            if trade["side"] == "LONG":
+                if low <= trade["sl"]:
+                    close_trade(symbol, str(row["close_time"]), trade["sl"], "SL")
                     send(
-                        f"🚨 ELITE VIP SIGNAL\n\n"
-                        f"BTCUSDT.P | {side}\n\n"
-                        f"Entry: {round(entry, 2)}\n"
-                        f"TP: {round(tp, 2)}\n"
-                        f"SL: {round(sl, 2)}\n\n"
-                        f"Setup: {setup}\n"
-                        f"Mode: {CURRENT_MODE}\n"
-                        f"VIP WR: {wr(vip_wins, vip_losses)}% | W:{vip_wins} L:{vip_losses}\n"
-                        f"{all_stats()}"
+                        f"❌ VIP TRADE CLOSED\n\n"
+                        f"🔴 {symbol} {trade['side']} stopped out\n"
+                        f"🛑 Exit: {round(trade['sl'], 4)}"
                     )
-
-                    open_trade = {
-                        "signal_type": "VIP",
-                        "side": "LONG" if "BUY" in side else "SHORT",
-                        "entry": round(entry, 2),
-                        "tp": tp,
-                        "sl": sl,
-                        "setup": setup,
-                    }
-                    signals_today += 1
-                    last_signal_ts = time.time()
-                    last_signal_side = side
-
-            # SCALP
-            if (
-                not open_trade
-                and scalps_today < limits["max_scalp"]
-                and scalp_count_this_hour < limits["scalp_per_hour"]
-            ):
-                scalp = scalp_signal(entry_df, trend_label)
-                if scalp:
-                    side, entry, tp, sl, setup = scalp
-
+                    to_remove.append(symbol)
+                elif high >= trade["tp"]:
+                    close_trade(symbol, str(row["close_time"]), trade["tp"], "TP")
                     send(
-                        f"⚡ ELITE SCALP SIGNAL\n\n"
-                        f"BTCUSDT.P | {side}\n\n"
-                        f"Entry: {round(entry, 2)}\n"
-                        f"TP: {round(tp, 2)}\n"
-                        f"SL: {round(sl, 2)}\n\n"
-                        f"Setup: {setup}\n"
-                        f"Mode: {CURRENT_MODE}\n"
-                        f"SCALP WR: {wr(scalp_wins, scalp_losses)}% | W:{scalp_wins} L:{scalp_losses}\n"
-                        f"{all_stats()}"
+                        f"✅ VIP TRADE CLOSED\n\n"
+                        f"🟢 {symbol} {trade['side']} take profit hit\n"
+                        f"🎯 Exit: {round(trade['tp'], 4)}"
                     )
+                    to_remove.append(symbol)
+            else:
+                if high >= trade["sl"]:
+                    close_trade(symbol, str(row["close_time"]), trade["sl"], "SL")
+                    send(
+                        f"❌ VIP TRADE CLOSED\n\n"
+                        f"🔴 {symbol} {trade['side']} stopped out\n"
+                        f"🛑 Exit: {round(trade['sl'], 4)}"
+                    )
+                    to_remove.append(symbol)
+                elif low <= trade["tp"]:
+                    close_trade(symbol, str(row["close_time"]), trade["tp"], "TP")
+                    send(
+                        f"✅ VIP TRADE CLOSED\n\n"
+                        f"🟢 {symbol} {trade['side']} take profit hit\n"
+                        f"🎯 Exit: {round(trade['tp'], 4)}"
+                    )
+                    to_remove.append(symbol)
+        except Exception as e:
+            print("Trade update error:", symbol, e)
 
-                    open_trade = {
-                        "signal_type": "SCALP",
-                        "side": "LONG" if "BUY" in side else "SHORT",
-                        "entry": round(entry, 2),
-                        "tp": tp,
-                        "sl": sl,
-                        "setup": setup,
-                    }
-                    scalps_today += 1
-                    scalp_count_this_hour += 1
-                    last_signal_ts = time.time()
-                    last_signal_side = side
+    for symbol in to_remove:
+        open_trades.pop(symbol, None)
 
-    except Exception as e:
-        safe_send_error(f"ERROR: {str(e)}")
 
-    time.sleep(LOOP_SLEEP)
+def handle_commands():
+    updates = get_updates()
+    for update in updates:
+        message = update.get("message", {})
+        text = message.get("text", "").strip().lower()
+        chat_id = str(message.get("chat", {}).get("id", ""))
+
+        if not chat_id:
+            continue
+
+        if text == "/start":
+            send("🚀 VIP signal bot is now live.\nCommands:\n/stats\n/opentrades\n/help", chat_id)
+        elif text == "/help":
+            send("Commands:\n/stats - performance summary\n/opentrades - show open trades", chat_id)
+        elif text == "/stats":
+            send(summarize_performance(), chat_id)
+        elif text == "/opentrades":
+            send(open_trades_text(), chat_id)
+
+
+def run_signal_engine(now, local_now):
+    global signals_today, bonus_signals_today, last_no_signal_day, last_scheduled_key, last_5h_update, last_signal_scan_ts
+
+    reset_daily_counter()
+    update_open_trades()
+
+    current_ts = time.time()
+    if current_ts - last_signal_scan_ts >= CHECK_SIGNALS_EVERY_SECONDS:
+        if signals_today < MAX_SIGNALS_PER_DAY:
+            for symbol in SYMBOLS:
+                if signals_today >= MAX_SIGNALS_PER_DAY:
+                    break
+                if symbol in open_trades:
+                    continue
+
+                try:
+                    result = build_signal(symbol, bonus=False)
+                    if result:
+                        signal_key, msg, side, candle_time, price, sl, tp, signal_type = result
+                        if last_signal_by_symbol.get(symbol) != signal_key:
+                            send(msg)
+                            last_signal_by_symbol[symbol] = signal_key
+                            open_trades[symbol] = {
+                                "side": side,
+                                "entry": price,
+                                "sl": sl,
+                                "tp": tp,
+                                "entry_time": candle_time,
+                                "signal_type": signal_type,
+                            }
+                            log_new_trade(symbol, side, candle_time, price, sl, tp, signal_type)
+                            signals_today += 1
+                except Exception as symbol_error:
+                    print(symbol, "main signal error:", symbol_error)
+
+        if bonus_signals_today < MAX_BONUS_SIGNALS_PER_DAY:
+            for symbol in SYMBOLS:
+                if bonus_signals_today >= MAX_BONUS_SIGNALS_PER_DAY:
+                    break
+                if symbol in open_trades:
+                    continue
+
+                try:
+                    result = build_signal(symbol, bonus=True)
+                    if result:
+                        signal_key, msg, side, candle_time, price, sl, tp, signal_type = result
+                        bonus_key = f"{symbol}-BONUS-{candle_time}"
+                        if last_signal_by_symbol.get(symbol + "_bonus") != bonus_key:
+                            send(msg)
+                            last_signal_by_symbol[symbol + "_bonus"] = bonus_key
+                            open_trades[symbol] = {
+                                "side": side,
+                                "entry": price,
+                                "sl": sl,
+                                "tp": tp,
+                                "entry_time": candle_time,
+                                "signal_type": signal_type,
+                            }
+                            log_new_trade(symbol, side, candle_time, price, sl, tp, signal_type)
+                            bonus_signals_today += 1
+                except Exception as symbol_error:
+                    print(symbol, "bonus signal error:", symbol_error)
+
+        last_signal_scan_ts = current_ts
+
+    scheduled_key = local_now.strftime("%Y-%m-%d-%H-%M")
+    if (local_now.hour, local_now.minute) in SCHEDULED_TIMES:
+        if last_scheduled_key != scheduled_key:
+            send(scheduled_update_text())
+
+            if signals_today == 0 and FORCED_SIGNAL_SYMBOL not in open_trades:
+                try:
+                    result = build_forced_signal(FORCED_SIGNAL_SYMBOL)
+                    signal_key, msg, side, candle_time, price, sl, tp, signal_type = result
+                    forced_key = f"{FORCED_SIGNAL_SYMBOL}-FORCED-{candle_time}"
+                    if last_signal_by_symbol.get(FORCED_SIGNAL_SYMBOL + "_forced") != forced_key:
+                        send(msg)
+                        last_signal_by_symbol[FORCED_SIGNAL_SYMBOL + "_forced"] = forced_key
+                        open_trades[FORCED_SIGNAL_SYMBOL] = {
+                            "side": side,
+                            "entry": price,
+                            "sl": sl,
+                            "tp": tp,
+                            "entry_time": candle_time,
+                            "signal_type": signal_type,
+                        }
+                        log_new_trade(FORCED_SIGNAL_SYMBOL, side, candle_time, price, sl, tp, signal_type)
+                        signals_today += 1
+                except Exception as forced_error:
+                    print("forced signal error:", forced_error)
+
+            last_scheduled_key = scheduled_key
+
+    five_hour_bucket = now.strftime("%Y-%m-%d-") + str(now.hour // 5)
+    if now.minute == 0 and last_5h_update != five_hour_bucket:
+        send(summarize_performance())
+        last_5h_update = five_hour_bucket
+
+    today = now.date()
+    if now.hour == 23 and now.minute >= 55:
+        if signals_today == 0 and bonus_signals_today == 0 and last_no_signal_day != today:
+            send("📭 No signals today — market not clean")
+            last_no_signal_day = today
+
+
+def main():
+    send("🚀 VIP signal bot is now live.")
+
+    while True:
+        try:
+            handle_commands()
+
+            now = datetime.now(timezone.utc)
+            local_now = now.astimezone(LOCAL_TZ)
+
+            if START_HOUR <= local_now.hour < END_HOUR:
+                run_signal_engine(now, local_now)
+
+        except Exception as e:
+            print("Main loop error:", e)
+
+        time.sleep(1)
+
+
+if __name__ == "__main__":
+    main()
