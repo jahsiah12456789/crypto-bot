@@ -14,7 +14,6 @@ LOW_TF = "15m"
 MID_TF = "30m"
 HIGH_TF = "1h"
 
-# faster bot
 CHECK_SIGNALS_EVERY_SECONDS = 5
 COMMAND_POLL_TIMEOUT = 1
 
@@ -33,7 +32,7 @@ SCHEDULED_TIMES = [(10, 30), (15, 30), (21, 0)]
 FORCED_SIGNAL_SYMBOL = "BTCUSDT"
 
 START_HOUR = 9
-END_HOUR = 22  # 10 PM Toronto
+END_HOUR = 22
 
 last_signal_by_symbol = {}
 signals_today = 0
@@ -49,26 +48,33 @@ last_signal_scan_ts = 0.0
 
 def send(msg, chat_id=None):
     target_chat = str(chat_id) if chat_id is not None else CHAT_ID
-    requests.post(
-        f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-        json={"chat_id": target_chat, "text": msg},
-        timeout=20,
-    )
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+            json={"chat_id": target_chat, "text": msg},
+            timeout=20,
+        )
+    except Exception as e:
+        print("send error:", e)
 
 
 def get_updates():
     global last_update_id
-    url = f"https://api.telegram.org/bot{TOKEN}/getUpdates"
-    r = requests.get(
-        url,
-        params={"offset": last_update_id + 1, "timeout": COMMAND_POLL_TIMEOUT},
-        timeout=20,
-    )
-    r.raise_for_status()
-    data = r.json().get("result", [])
-    if data:
-        last_update_id = data[-1]["update_id"]
-    return data
+    try:
+        url = f"https://api.telegram.org/bot{TOKEN}/getUpdates"
+        r = requests.get(
+            url,
+            params={"offset": last_update_id + 1, "timeout": COMMAND_POLL_TIMEOUT},
+            timeout=20,
+        )
+        r.raise_for_status()
+        data = r.json().get("result", [])
+        if data:
+            last_update_id = data[-1]["update_id"]
+        return data
+    except Exception as e:
+        print("get_updates error:", e)
+        return []
 
 
 def get_data(symbol, interval, limit=300):
@@ -192,39 +198,68 @@ def close_trade(symbol, exit_time, exit_price, status):
 
 
 def summarize_performance():
-    df = pd.read_csv(TRADES_FILE)
-    closed = df[df["status"].isin(["TP", "SL"])]
-    open_count = len(df[df["status"] == "OPEN"])
+    try:
+        if not os.path.exists(TRADES_FILE):
+            return (
+                "📊 VIP STATS\n"
+                "━━━━━━━━━━━━━━\n"
+                "Closed Trades: 0\n"
+                "Open Trades: 0\n"
+                "Win Rate: 0%\n"
+                "Total PnL %: 0%\n"
+                "Total R: 0"
+            )
 
-    if closed.empty:
+        df = pd.read_csv(TRADES_FILE)
+
+        if df.empty:
+            return (
+                "📊 VIP STATS\n"
+                "━━━━━━━━━━━━━━\n"
+                "Closed Trades: 0\n"
+                "Open Trades: 0\n"
+                "Win Rate: 0%\n"
+                "Total PnL %: 0%\n"
+                "Total R: 0"
+            )
+
+        if "status" not in df.columns:
+            return "📊 VIP STATS\n━━━━━━━━━━━━━━\nStats file format error."
+
+        closed = df[df["status"].isin(["TP", "SL"])]
+        open_count = len(df[df["status"] == "OPEN"])
+
+        if closed.empty:
+            return (
+                "📊 VIP STATS\n"
+                "━━━━━━━━━━━━━━\n"
+                f"Closed Trades: 0\n"
+                f"Open Trades: {open_count}\n"
+                "Win Rate: 0%\n"
+                "Total PnL %: 0%\n"
+                "Total R: 0"
+            )
+
+        wins = (closed["status"] == "TP").sum()
+        losses = (closed["status"] == "SL").sum()
+        total = len(closed)
+        win_rate = round((wins / total) * 100, 2) if total else 0
+        total_r = round(pd.to_numeric(closed["r_multiple"], errors="coerce").fillna(0).sum(), 2)
+        total_pnl = round(pd.to_numeric(closed["pnl_pct"], errors="coerce").fillna(0).sum(), 2)
+
         return (
             "📊 VIP STATS\n"
             "━━━━━━━━━━━━━━\n"
-            f"Closed Trades: 0\n"
+            f"Closed Trades: {total}\n"
             f"Open Trades: {open_count}\n"
-            "Win Rate: 0%\n"
-            "Total PnL %: 0%\n"
-            "Total R: 0"
+            f"Wins: {wins}\n"
+            f"Losses: {losses}\n"
+            f"Win Rate: {win_rate}%\n"
+            f"Total PnL %: {total_pnl}%\n"
+            f"Total R: {total_r}"
         )
-
-    wins = (closed["status"] == "TP").sum()
-    losses = (closed["status"] == "SL").sum()
-    total = len(closed)
-    win_rate = round((wins / total) * 100, 2) if total else 0
-    total_r = round(pd.to_numeric(closed["r_multiple"], errors="coerce").fillna(0).sum(), 2)
-    total_pnl = round(pd.to_numeric(closed["pnl_pct"], errors="coerce").fillna(0).sum(), 2)
-
-    return (
-        "📊 VIP STATS\n"
-        "━━━━━━━━━━━━━━\n"
-        f"Closed Trades: {total}\n"
-        f"Open Trades: {open_count}\n"
-        f"Wins: {wins}\n"
-        f"Losses: {losses}\n"
-        f"Win Rate: {win_rate}%\n"
-        f"Total PnL %: {total_pnl}%\n"
-        f"Total R: {total_r}"
-    )
+    except Exception as e:
+        return f"📊 VIP STATS ERROR\n{str(e)}"
 
 
 def open_trades_text():
@@ -323,21 +358,12 @@ def build_signal(symbol, bonus=False):
         signal_type = "MAIN"
 
     long_cond = (
-        bullish_cross
-        and mid_bull
-        and high_bull
-        and strong_trend
-        and not_overextended_long
-        and volatility_ok
+        bullish_cross and mid_bull and high_bull and strong_trend
+        and not_overextended_long and volatility_ok
     )
-
     short_cond = (
-        bearish_cross
-        and mid_bear
-        and high_bear
-        and strong_trend
-        and not_overextended_short
-        and volatility_ok
+        bearish_cross and mid_bear and high_bear and strong_trend
+        and not_overextended_short and volatility_ok
     )
 
     if long_cond:
@@ -355,18 +381,9 @@ def build_signal(symbol, bonus=False):
     signal_key = f"{side}-{candle_time}-{signal_type}"
 
     msg = format_signal_message(
-        symbol=symbol,
-        side=side,
-        price=price,
-        sl=sl,
-        tp=tp,
-        rr=rr,
-        rsi_value=row["rsi14"],
-        adx_value=row["adx14"],
-        candle_time=candle_time,
-        signal_type=signal_type,
+        symbol, side, price, sl, tp, rr,
+        row["rsi14"], row["adx14"], candle_time, signal_type
     )
-
     return signal_key, msg, side, candle_time, price, sl, tp, signal_type
 
 
@@ -390,18 +407,9 @@ def build_forced_signal(symbol):
     rr = round(abs(tp - price) / abs(price - sl), 2) if price != sl else 0
 
     msg = format_signal_message(
-        symbol=symbol,
-        side=side,
-        price=price,
-        sl=sl,
-        tp=tp,
-        rr=rr,
-        rsi_value=row["rsi14"],
-        adx_value=row["adx14"],
-        candle_time=candle_time,
-        signal_type="FORCED",
+        symbol, side, price, sl, tp, rr,
+        row["rsi14"], row["adx14"], candle_time, "FORCED"
     )
-
     return f"{side}-{candle_time}-FORCED", msg, side, candle_time, price, sl, tp, "FORCED"
 
 
@@ -489,7 +497,6 @@ def run_signal_engine(now, local_now):
                     break
                 if symbol in open_trades:
                     continue
-
                 try:
                     result = build_signal(symbol, bonus=False)
                     if result:
@@ -507,8 +514,8 @@ def run_signal_engine(now, local_now):
                             }
                             log_new_trade(symbol, side, candle_time, price, sl, tp, signal_type)
                             signals_today += 1
-                except Exception as symbol_error:
-                    print(symbol, "main signal error:", symbol_error)
+                except Exception as e:
+                    print(symbol, "main signal error:", e)
 
         if bonus_signals_today < MAX_BONUS_SIGNALS_PER_DAY:
             for symbol in SYMBOLS:
@@ -516,7 +523,6 @@ def run_signal_engine(now, local_now):
                     break
                 if symbol in open_trades:
                     continue
-
                 try:
                     result = build_signal(symbol, bonus=True)
                     if result:
@@ -535,38 +541,37 @@ def run_signal_engine(now, local_now):
                             }
                             log_new_trade(symbol, side, candle_time, price, sl, tp, signal_type)
                             bonus_signals_today += 1
-                except Exception as symbol_error:
-                    print(symbol, "bonus signal error:", symbol_error)
+                except Exception as e:
+                    print(symbol, "bonus signal error:", e)
 
         last_signal_scan_ts = current_ts
 
     scheduled_key = local_now.strftime("%Y-%m-%d-%H-%M")
-    if (local_now.hour, local_now.minute) in SCHEDULED_TIMES:
-        if last_scheduled_key != scheduled_key:
-            send(scheduled_update_text())
+    if (local_now.hour, local_now.minute) in SCHEDULED_TIMES and last_scheduled_key != scheduled_key:
+        send(scheduled_update_text())
 
-            if signals_today == 0 and FORCED_SIGNAL_SYMBOL not in open_trades:
-                try:
-                    result = build_forced_signal(FORCED_SIGNAL_SYMBOL)
-                    signal_key, msg, side, candle_time, price, sl, tp, signal_type = result
-                    forced_key = f"{FORCED_SIGNAL_SYMBOL}-FORCED-{candle_time}"
-                    if last_signal_by_symbol.get(FORCED_SIGNAL_SYMBOL + "_forced") != forced_key:
-                        send(msg)
-                        last_signal_by_symbol[FORCED_SIGNAL_SYMBOL + "_forced"] = forced_key
-                        open_trades[FORCED_SIGNAL_SYMBOL] = {
-                            "side": side,
-                            "entry": price,
-                            "sl": sl,
-                            "tp": tp,
-                            "entry_time": candle_time,
-                            "signal_type": signal_type,
-                        }
-                        log_new_trade(FORCED_SIGNAL_SYMBOL, side, candle_time, price, sl, tp, signal_type)
-                        signals_today += 1
-                except Exception as forced_error:
-                    print("forced signal error:", forced_error)
+        if signals_today == 0 and FORCED_SIGNAL_SYMBOL not in open_trades:
+            try:
+                result = build_forced_signal(FORCED_SIGNAL_SYMBOL)
+                signal_key, msg, side, candle_time, price, sl, tp, signal_type = result
+                forced_key = f"{FORCED_SIGNAL_SYMBOL}-FORCED-{candle_time}"
+                if last_signal_by_symbol.get(FORCED_SIGNAL_SYMBOL + "_forced") != forced_key:
+                    send(msg)
+                    last_signal_by_symbol[FORCED_SIGNAL_SYMBOL + "_forced"] = forced_key
+                    open_trades[FORCED_SIGNAL_SYMBOL] = {
+                        "side": side,
+                        "entry": price,
+                        "sl": sl,
+                        "tp": tp,
+                        "entry_time": candle_time,
+                        "signal_type": signal_type,
+                    }
+                    log_new_trade(FORCED_SIGNAL_SYMBOL, side, candle_time, price, sl, tp, signal_type)
+                    signals_today += 1
+            except Exception as e:
+                print("forced signal error:", e)
 
-            last_scheduled_key = scheduled_key
+        last_scheduled_key = scheduled_key
 
     five_hour_bucket = now.strftime("%Y-%m-%d-") + str(now.hour // 5)
     if now.minute == 0 and last_5h_update != five_hour_bucket:
@@ -581,6 +586,7 @@ def run_signal_engine(now, local_now):
 
 
 def main():
+    ensure_trades_file()
     send("🚀 VIP signal bot is now live.")
 
     while True:
